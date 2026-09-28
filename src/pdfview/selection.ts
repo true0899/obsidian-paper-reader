@@ -145,7 +145,13 @@ export function separateSelectionLines(rects: HighlightRect[]): HighlightRect[] 
 	});
 }
 
-/** Draw the active browser selection with line-safe bands over the PDF page. */
+/**
+ * Draw the active selection with line-safe bands over the PDF page. The native
+ * highlight is suppressed in CSS for the whole text layer; this overlay
+ * supplies visible feedback while the selection is active.
+ * `pr-selection-preview` is a bookkeeping marker for "this page currently
+ * shows a preview", used to skip untouched pages on repaint.
+ */
 export function renderSelectionPreview(layer: HTMLElement, rects: HighlightRect[], scale: number): void {
 	layer.replaceChildren();
 	layer.parentElement?.classList.toggle("pr-selection-preview", rects.length > 0);
@@ -188,29 +194,16 @@ function locateInPageText(
 	return { offset: -1, length: 0 };
 }
 
-/**
- * Map the current DOM selection (inside a pdf.js text layer) to page number,
- * unscaled page rects and a text fingerprint. Returns null when the selection
- * is empty or outside the reader.
- *
- * M1 limitation: only the part of the selection on the anchor page is kept.
- */
-export function selectionToPayload(
+/** Visible selection geometry for one page; storage still uses the anchor page. */
+export function selectionRectsForPage(
 	selection: Selection,
-	scale: number,
-	getPageText: (page: number) => string | undefined
-): SelectionPayload | null {
-	if (selection.isCollapsed || selection.rangeCount === 0) return null;
-	const text = selection.toString();
-	if (!text.trim()) return null;
-
+	pageEl: HTMLElement,
+	scale: number
+): HighlightRect[] {
+	if (selection.isCollapsed || selection.rangeCount === 0) return [];
 	const range = selection.getRangeAt(0);
-	const anchorEl = elementOf(selection.anchorNode);
-	const pageEl = anchorEl?.closest(".pr-page");
-	if (!(pageEl instanceof HTMLElement)) return null;
-	const page = Number(pageEl.dataset.pageNumber);
-	if (!Number.isFinite(page)) return null;
-
+	if (!range.intersectsNode(pageEl)) return [];
+	const text = selection.toString();
 	const pageRect = pageEl.getBoundingClientRect();
 	const toPageRect = (
 		left: number,
@@ -241,6 +234,7 @@ export function selectionToPayload(
 	const startCaret = caretRect(range.startContainer, range.startOffset);
 	const endCaret = caretRect(range.endContainer, range.endOffset);
 	const singleLineRect =
+		pageEl.contains(range.startContainer) && pageEl.contains(range.endContainer) &&
 		!text.includes("\n") && startCaret && endCaret
 			? buildSingleLineRect(startCaret, endCaret)
 			: null;
@@ -286,6 +280,32 @@ export function selectionToPayload(
 			if (rect) rects.push(rect);
 		}
 	}
+	return rects;
+}
+
+/**
+ * Map the current DOM selection (inside a pdf.js text layer) to page number,
+ * unscaled page rects and a text fingerprint. Returns null when the selection
+ * is empty or outside the reader.
+ *
+ * M1 limitation: only the part of the selection on the anchor page is kept.
+ */
+export function selectionToPayload(
+	selection: Selection,
+	scale: number,
+	getPageText: (page: number) => string | undefined
+): SelectionPayload | null {
+	if (selection.isCollapsed || selection.rangeCount === 0) return null;
+	const text = selection.toString();
+	if (!text.trim()) return null;
+
+	const range = selection.getRangeAt(0);
+	const anchorEl = elementOf(selection.anchorNode);
+	const pageEl = anchorEl?.closest(".pr-page");
+	if (!(pageEl instanceof HTMLElement)) return null;
+	const page = Number(pageEl.dataset.pageNumber);
+	if (!Number.isFinite(page)) return null;
+	const rects = selectionRectsForPage(selection, pageEl, scale);
 	if (rects.length === 0) return null;
 
 	const pageText = getPageText(page) ?? "";

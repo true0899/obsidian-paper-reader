@@ -2,7 +2,7 @@ import { ItemView, Menu, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian"
 import type { ViewStateResult } from "obsidian";
 import type PaperReaderPlugin from "../main";
 import { PdfRenderer, RenderedPage } from "./PdfRenderer";
-import { SelectionPayload, mergeTextRects, textRangeRects, rectsOverlap, renderSelectionPreview, sameSelection, selectionToPayload } from "./selection";
+import { SelectionPayload, mergeTextRects, textRangeRects, rectsOverlap, renderSelectionPreview, sameSelection, selectionRectsForPage, selectionToPayload } from "./selection";
 import { PopupStateCache } from "./popupCache";
 import {
 	LiveStroke,
@@ -95,6 +95,8 @@ export class PaperReaderView extends ItemView {
 	private pageRender: { page: number; abort: AbortController } | null = null;
 	private pageWindowTimer: number | null = null;
 	private selectionTimer: number | null = null;
+	/** pending rAF that repaints the drag overlay; 0 when none is queued */
+	private selectionPreviewFrame = 0;
 
 	private popup: SelectionPopup;
 	private popupCache = new PopupStateCache();
@@ -243,9 +245,12 @@ export class PaperReaderView extends ItemView {
 		this.registerDomEvent(this.scrollEl, "pointerdown", (e: PointerEvent) =>
 			this.onPenPointerDown(e)
 		);
-		this.registerDomEvent(this.scrollEl, "pointermove", (e: PointerEvent) =>
-			this.onPenPointerMove(e)
-		);
+		this.registerDomEvent(this.scrollEl, "pointermove", (e: PointerEvent) => {
+			this.onPenPointerMove(e);
+			if (!this.drawingTool && (e.buttons & 1) !== 0 && this.pagesEl.contains(e.target as Node)) {
+				this.scheduleSelectionPreview();
+			}
+		});
 		this.registerDomEvent(this.scrollEl, "pointerup", (e: PointerEvent) =>
 			this.onPenPointerEnd(e, true)
 		);
@@ -255,6 +260,8 @@ export class PaperReaderView extends ItemView {
 		// track selection lifecycle to enable/disable the header action group
 		this.registerDomEvent(document, "selectionchange", () => {
 			if (this.closed) return;
+			// Keep the custom selection preview current during keyboard selection.
+			this.scheduleSelectionPreview();
 			if (this.selectionTimer !== null) window.clearTimeout(this.selectionTimer);
 			this.selectionTimer = window.setTimeout(() => this.refreshSelectionState(), 100);
 		});
@@ -322,6 +329,10 @@ export class PaperReaderView extends ItemView {
 			if (timer !== null) window.clearTimeout(timer);
 		}
 		this.positionTimer = this.pageWindowTimer = this.selectionTimer = null;
+		if (this.selectionPreviewFrame !== 0) {
+			window.cancelAnimationFrame(this.selectionPreviewFrame);
+			this.selectionPreviewFrame = 0;
+		}
 		await this.savePositionNow().catch(error => console.error("[paper-reader] position save failed", error));
 		if (this.liveStroke) {
 			this.liveStroke.discard();
@@ -1576,32 +1587,45 @@ export class PaperReaderView extends ItemView {
 
 	// ---- selection state ----
 
+	/** Only selections anchored inside this reader can drive its preview or actions. */
+	private activeTextSelection(): Selection | null {
+		const sel = window.getSelection();
+		return sel && !sel.isCollapsed && sel.toString().trim() && sel.anchorNode && this.pagesEl.contains(sel.anchorNode)
+			? sel : null;
+	}
+
+	/** Draw the active selection over the page without touching committed state. */
+	private paintSelectionPreview(sel: Selection | null): void {
+		for (const page of this.pages) {
+			const rects = sel ? selectionRectsForPage(sel, page.wrapper, this.scale) : [];
+			if (rects.length || page.wrapper.classList.contains("pr-selection-preview")) {
+				renderSelectionPreview(page.selectionLayer, rects, this.scale);
+			}
+		}
+	}
+
+	/**
+	 * Coalesce drag repaints to one per frame. selectionchange is queued by the
+	 * browser, so no particular first-frame latency is guaranteed.
+	 */
+	private scheduleSelectionPreview(): void {
+		if (this.selectionPreviewFrame !== 0) return;
+		this.selectionPreviewFrame = window.requestAnimationFrame(() => {
+			this.selectionPreviewFrame = 0;
+			if (this.closed) return;
+			this.paintSelectionPreview(this.activeTextSelection());
+		});
+	}
+
 	/**
 	 * Recompute the current selection payload and sync the header action
 	 * group's enabled state. Called on mouseup and (debounced) selectionchange.
 	 */
 	private refreshSelectionState(): void {
-		const sel = window.getSelection();
-		let payload: SelectionPayload | null = null;
-		if (sel && !sel.isCollapsed && sel.toString().trim()) {
-			const anchorEl =
-				sel.anchorNode?.nodeType === Node.ELEMENT_NODE
-					? (sel.anchorNode as Element)
-					: sel.anchorNode?.parentElement;
-			// only react to selections inside this view's text layers
-			if (anchorEl && this.pagesEl.contains(anchorEl)) {
-				payload = selectionToPayload(sel, this.scale, (p) =>
-					this.renderer.getPageText(p)
-				);
-			}
-		}
+		const sel = this.activeTextSelection();
+		const payload = sel ? selectionToPayload(sel, this.scale, (p) => this.renderer.getPageText(p)) : null;
 		this.currentPayload = payload;
-		for (const page of this.pages) {
-			const rects = payload?.page === page.pageNumber ? payload.rects : [];
-			if (rects.length || page.wrapper.classList.contains("pr-selection-preview")) {
-				renderSelectionPreview(page.selectionLayer, rects, this.scale);
-			}
-		}
+		this.paintSelectionPreview(sel);
 		this.selectionActions?.setEnabled(!!payload);
 	}
 
