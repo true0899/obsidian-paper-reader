@@ -248,6 +248,62 @@ function check(label, cond, detail = "") {
 	// Real reader orchestration (host APIs stubbed), not just the renderer module.
 	const window30 = await page.evaluate(() => window.__h.openReader());
 	check("30 页只渲染视口附近页面", window30.pages === 30 && window30.mounted.length <= 8 && window30.mounted.length > 0 && !window30.failures.length, JSON.stringify(window30));
+
+	// Native selection is transparent; the reader supplies the drag preview.
+	const dragLine = await page.evaluate(() => {
+		const v = window.__h.reader;
+		const span = v.pagesEl.querySelector(".textLayer span");
+		const rects = Array.from(v.pagesEl.querySelectorAll(".textLayer span"), (s) => s.getBoundingClientRect())
+			.filter((r) => r.width > 0 && r.height > 0);
+		const top = Math.min(...rects.map((r) => r.top));
+		const line = rects.filter((r) => Math.abs(r.top - top) < 4);
+		return {
+			native: getComputedStyle(span, "::selection").backgroundColor,
+			y: top + Math.max(...line.map((r) => r.height)) / 2,
+			x: Math.min(...line.map((r) => r.left)),
+			right: Math.max(...line.map((r) => r.right)),
+		};
+	});
+	check("原生选区高亮全程关闭，只留自绘色带", dragLine.native === "rgba(0, 0, 0, 0)", dragLine.native);
+	await page.mouse.move(dragLine.x + 1, dragLine.y);
+	await page.mouse.down();
+	// Check while the pointer is still down, before mouseup finalizes actions.
+	await page.mouse.move(dragLine.x + (dragLine.right - dragLine.x) * 0.4, dragLine.y, { steps: 3 });
+	const midDrag = await page.evaluate(() => {
+		const layer = window.__h.reader.pagesEl.querySelector(".pr-selection-layer");
+		return {
+			bands: layer ? layer.children.length : 0,
+			fill: layer && layer.firstElementChild ? getComputedStyle(layer.firstElementChild).backgroundColor : null,
+			chars: window.getSelection().toString().length,
+		};
+	});
+	check("拖拽中（未松开鼠标）已显示自绘选区", midDrag.bands > 0 && midDrag.fill !== "rgba(0, 0, 0, 0)" && midDrag.chars > 0, JSON.stringify(midDrag));
+	await page.mouse.up();
+	await page.evaluate(() => window.__h.reader.clearSelection());
+	const acrossPages = await page.evaluate(async () => {
+		const v = window.__h.reader;
+		await v.scrollToPage(2);
+		const pages = v.pages.filter(p => p.wrapper.querySelector(".textLayer span"));
+		const [first, second] = pages.slice(0, 2);
+		if (!first || !second) return { mounted: pages.map(p => p.pageNumber) };
+		const start = first.wrapper.querySelector(".textLayer span").firstChild;
+		const end = second.wrapper.querySelector(".textLayer span").firstChild;
+		const range = document.createRange();
+		range.setStart(start, 0);
+		range.setEnd(end, Math.min(3, end.textContent.length));
+		const selection = window.getSelection();
+		selection.removeAllRanges(); selection.addRange(range);
+		document.dispatchEvent(new Event("selectionchange"));
+		await new Promise(requestAnimationFrame);
+		const bands = pages.slice(0, 2).map(p => p.selectionLayer.children.length);
+		selection.setBaseAndExtent(end, Math.min(3, end.textContent.length), start, 0);
+		document.dispatchEvent(new Event("selectionchange"));
+		await new Promise(requestAnimationFrame);
+		const reverse = pages.slice(0, 2).map(p => p.selectionLayer.children.length);
+		v.clearSelection();
+		return { bands, reverse, pages: pages.slice(0, 2).map(p => p.pageNumber) };
+	});
+	check("跨页正反向选区两页均有可见色带", acrossPages.bands?.every(count => count > 0) && acrossPages.reverse?.every(count => count > 0), JSON.stringify(acrossPages));
 	const last = await page.evaluate(() => window.__h.readerNavigate(30));
 	check("远跳释放旧页面并加载末页", last.mounted.includes(30) && !last.mounted.includes(1) && last.mounted.length <= 8, JSON.stringify(last));
 	const windowSearch = await page.evaluate(async () => {

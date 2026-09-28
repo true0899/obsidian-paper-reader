@@ -243,12 +243,14 @@
 	position: absolute;
 }
 
-.pr-page.pr-selection-preview .textLayer ::selection {
+/* PDF.js native selection bands over scaled glyph spans; the reader paints
+   its own selection preview, including across pages. */
+.pr-page .textLayer ::selection {
 	background: transparent;
 	color: transparent;
 }
 
-.pr-page.pr-selection-preview .textLayer ::-moz-selection {
+.pr-page .textLayer ::-moz-selection {
 	background: transparent;
 	color: transparent;
 }
