@@ -23,11 +23,11 @@ export function createInkWidthControl(parent: HTMLElement, initial: number,
 		const raw = input.value.trim();
 		const parsed = Number(raw);
 		if (!raw || !Number.isFinite(parsed) || (!commit && (parsed < MIN_INK_WIDTH || parsed > MAX_INK_WIDTH))) {
-			if (commit) { sync(); flush(); } return;
+			if (commit) { sync(); void flush(); } return;
 		}
 		const next = Math.round(Math.max(MIN_INK_WIDTH, Math.min(MAX_INK_WIDTH, parsed)) * 10) / 10;
-		if (value !== next) { value = next; pending = true; onWidth(value, false); }
-		sync(); if (commit) flush();
+		if (value !== next) { value = next; pending = true; void onWidth(value, false); }
+		sync(); if (commit) void flush();
 	};
 	for (const input of [slider, number]) {
 		input.addEventListener("input", () => read(input, false));

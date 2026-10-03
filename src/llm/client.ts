@@ -73,7 +73,7 @@ export class LlmClient {
 		signal?.addEventListener("abort", cancel, { once: true });
 		if (signal?.aborted) cancel();
 		let timedOut = false;
-		const timer = setTimeout(() => { timedOut = true; abort.abort(); }, this.options.timeoutMs ?? 120000);
+		const timer = window.setTimeout(() => { timedOut = true; abort.abort(); }, this.options.timeoutMs ?? 120000);
 		let response: ChatResponse | undefined;
 		try {
 			if (abort.signal.aborted) throw new LlmError("abort", t("请求已取消"));
@@ -107,7 +107,7 @@ export class LlmClient {
 			if (e instanceof SyntaxError) throw new LlmError("parse", t("响应格式无法解析"));
 			throw new LlmError("network", t("网络错误：{error}", { error: e instanceof Error ? e.message : String(e) }));
 		} finally {
-			clearTimeout(timer);
+			window.clearTimeout(timer);
 			signal?.removeEventListener("abort", cancel);
 			abort.abort();
 			response?.close();
@@ -130,7 +130,9 @@ export class LlmClient {
 
 	async testConnection(signal?: AbortSignal): Promise<{ ok: boolean; error?: string }> {
 		try {
-			for await (const _ of this.request([{ role: "user", content: "hi" }], false, signal)) {}
+			const request = this.request([{ role: "user", content: "hi" }], false, signal);
+			await request.next();
+			await request.return(undefined);
 			return { ok: true };
 		} catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
 	}

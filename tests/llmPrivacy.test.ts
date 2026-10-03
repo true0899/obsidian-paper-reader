@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { App } from 'obsidian';
 import { LlmClient } from '../src/llm/client';
+import { fetchTransport } from './browserTransport';
 
 test('AI blocks unsafe endpoints and configured requests never show a confirmation', async () => {
  const oldWindow = globalThis.window;
@@ -14,7 +15,7 @@ test('AI blocks unsafe endpoints and configured requests never show a confirmati
   assert.equal(options?.redirect, 'error');
   return new Response('{"choices":[{"message":{"content":"ok"}}]}', {status: 200});
  }) as typeof fetch;
- const client = new LlmClient(new App(), () => ({baseUrl, apiKey:'test-only', model:'test'}));
+ const client = new LlmClient(new App(), () => ({baseUrl, apiKey:'test-only', model:'test'}), { transport: fetchTransport });
  const send = async () => { for await (const _ of client.streamChat([])) {} };
  try {
   for (baseUrl of ['http://example.com/v1', 'http://localhost.evil/v1', 'https://user:pass@example.com/v1', 'https://example.com/v1?key=secret', 'not a url']) {

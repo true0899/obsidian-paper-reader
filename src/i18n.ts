@@ -208,7 +208,6 @@ export function getUiLanguage(): UiLanguage {
 	try {
 		// getLanguage is public since Obsidian 1.8.7; older supported hosts fall back below.
 		if (typeof obsidian.getLanguage === "function") language = obsidian.getLanguage();
-		if (!language && typeof localStorage !== "undefined") language = localStorage.getItem("language") ?? undefined;
 	} catch { /* Browser storage can be unavailable in a sandboxed window. */ }
 	return resolveUiLanguage(language, typeof navigator !== "undefined" ? navigator.language : undefined);
 }

@@ -40,7 +40,7 @@ function styleRect(
 	scale: number
 ): void {
 	// Annotation bands must join with square edges, including note fills.
-	el.style.borderRadius = "0";
+	el.setCssStyles({ borderRadius: "0" });
 	const style = ann.style ?? "highlight";
 	if (ann.type === "note") {
 		// notes: light fill, distinct from highlights
