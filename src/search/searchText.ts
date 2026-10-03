@@ -1,38 +1,40 @@
+/// <reference lib="es2022.intl" />
 export interface SearchHit {
 	page: number;
-	/** char offset within the page's extracted text */
+	/** UTF-16 offset in extracted page text. */
 	index: number;
 	length: number;
 }
 
-/**
- * Lowercase + collapse whitespace runs to single spaces, keeping a map from
- * normalized index back to the original index. Handles the gaps pdf.js leaves
- * between text items so queries need not match a single span exactly.
- */
-export function normalizeWithMap(text: string): { norm: string; map: number[] } {
-	const map: number[] = [];
-	let norm = "";
-	let inWs = false;
-	for (let i = 0; i < text.length; i++) {
-		const ch = text[i];
-		if (/\s/.test(ch)) {
-			if (!inWs && norm.length > 0) {
-				norm += " ";
-				map.push(i);
-			}
+/** Unicode normalization with original UTF-16 boundaries for every output character. */
+export function normalizeWithMap(text: string): { norm: string; map: number[]; ends: number[] } {
+	const map: number[] = [], ends: number[] = [];
+	let norm = "", inWs = false;
+	const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	let skipUntil = 0;
+	for (const { segment, index } of segmenter.segment(text)) {
+		if (index < skipUntil || segment === "\u00ad") continue;
+		// PDF line-end hyphenation is a layout break, not part of the searched word.
+		if (/[-\u2010]/.test(segment) && /\p{L}$/u.test(text.slice(0, index))) {
+			const continuation = /^[-\u2010][ \t]*\r?\n[ \t]*(?=\p{L})/u.exec(text.slice(index));
+			if (continuation) { skipUntil = index + continuation[0].length; continue; }
+		}
+		if (/^\s+$/u.test(segment)) {
+			if (!inWs && norm.length > 0) { norm += " "; map.push(index); ends.push(index + segment.length); }
+			else if (inWs && ends.length) ends[ends.length - 1] = index + segment.length;
 			inWs = true;
 		} else {
-			norm += ch.toLowerCase();
-			map.push(i);
+			const normalized = segment.normalize("NFKC").toLowerCase();
+			norm += normalized;
+			for (let i = 0; i < normalized.length; i++) { map.push(index); ends.push(index + segment.length); }
 			inWs = false;
 		}
 	}
-	return { norm, map };
+	return { norm, map, ends };
 }
 
 export function normalizeQuery(query: string): string {
-	return query.trim().toLowerCase().replace(/\s+/g, " ");
+	return normalizeWithMap(query.trim()).norm;
 }
 
 /**
@@ -49,14 +51,14 @@ export function findHits(
 	for (let p = 0; p < pageTexts.length; p++) {
 		const text = pageTexts[p];
 		if (!text) continue;
-		const { norm, map } = normalizeWithMap(text);
+		const { norm, map, ends } = normalizeWithMap(text);
 		let from = 0;
 		for (;;) {
 			const idx = norm.indexOf(q, from);
 			if (idx < 0) break;
 			const origStart = map[idx];
-			const origEnd = idx + q.length - 1 < map.length ? map[idx + q.length - 1] : text.length - 1;
-			hits.push({ page: p + 1, index: origStart, length: origEnd - origStart + 1 });
+			const origEnd = ends[idx + q.length - 1] ?? text.length;
+			hits.push({ page: p + 1, index: origStart, length: origEnd - origStart });
 			from = idx + 1;
 		}
 	}

@@ -1,19 +1,18 @@
-import { ItemView, Menu, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { createInkWidthControl, MIN_INK_WIDTH, MAX_INK_WIDTH } from "../toolbar/InkWidthControl";
+import { DrawingController, type DrawingTool, type RectangleEdit } from "./DrawingController";
+import { t } from "../i18n";
+import { ReadingPositionManager } from "./ReadingPositionManager";
+import { refreshLeafHeader } from "../obsidian-internals";
+import { SearchController } from "../search/SearchController";
+import { ItemView, Menu, Modal, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import type { ViewStateResult } from "obsidian";
 import type PaperReaderPlugin from "../main";
 import { PdfRenderer, RenderedPage } from "./PdfRenderer";
-import { SelectionPayload, mergeTextRects, textRangeRects, rectsOverlap, renderSelectionPreview, sameSelection, selectionRectsForPage, selectionToPayload } from "./selection";
+import { SelectionPayload, rectsOverlap, renderSelectionPreview, sameSelection, selectionRectsForPage, selectionToPayload, domRangeForText as mappedTextRange, rangeFromPageTextOffset } from "./selection";
 import { PopupStateCache } from "./popupCache";
 import {
 	LiveStroke,
-	beginInkRectangle,
-	beginInkStroke,
-	inkBoundingRect,
-	rectanglePoints,
 	renderInkStrokes,
-	transformRectangle,
-	type RectangleBounds,
-	type RectangleHandle,
 } from "./InkLayer";
 import {
 	AnnotationHistory,
@@ -28,11 +27,12 @@ import { HighlightMenu } from "../toolbar/HighlightMenu";
 import { SelectionActions } from "../toolbar/SelectionActions";
 import { AnswerPanel, PanelMode } from "../panel/AnswerPanel";
 import { LlmClient, LlmError } from "../llm/client";
+import { buildPageContext } from "../llm/context";
 import { buildTranslateMessages } from "../llm/prompts";
 import { OutlineNode } from "../outline/OutlineTree";
 import { appendManyToNotes, appendToNotes, NotesEntry } from "../storage/notesWriter";
 import { ReadingPosition } from "../settings";
-import { SearchHit, findHits } from "../search/searchText";
+import { SearchHit } from "../search/searchText";
 import { inkPreviewSvg } from "./AnnotationList";
 import {
 	Annotation,
@@ -46,16 +46,10 @@ export const VIEW_TYPE_PAPER_READER = "paper-reader-view";
 
 type LayoutMode = "continuous" | "single" | "double-odd" | "double-even";
 type ZoomMode = "fit-width" | "fit-height" | "manual";
-type DrawingTool = "pen" | "rectangle" | null;
-type RectangleEdit = {
-	id: string; page: number; pointerId: number; handle: RectangleHandle;
-	startX: number; startY: number; bounds: RectangleBounds; before: Annotation;
-};
 
 const MIN_SCALE = 0.3;
 const MAX_SCALE = 5;
 const PAGE_GAP = 16;
-const FULL_TEXT_LIMIT = 12_000;
 
 export class PaperReaderView extends ItemView {
 	private plugin: PaperReaderPlugin;
@@ -68,6 +62,12 @@ export class PaperReaderView extends ItemView {
 	private headerEl!: HTMLElement;
 	private pageInputEl: HTMLInputElement | null = null;
 	private pageTotalEl: HTMLElement | null = null;
+	private pageLabels: string[] | null = null;
+	private navigationBack: ReadingPosition[] = [];
+	private pendingNoteIds: string[] = [];
+	private passwordModal: Modal | null = null;
+	private editingRangeId: string | null = null;
+	private rangeDrag: { node: Node; offset: number; pointerId: number } | null = null;
 	private bodyEl!: HTMLElement;
 	private scrollEl!: HTMLElement;
 	private pagesEl!: HTMLElement;
@@ -105,12 +105,21 @@ export class PaperReaderView extends ItemView {
 	private currentPayload: SelectionPayload | null = null;
 	/** session-scoped annotation style/color chosen in the popup */
 	private popupStyle: AnnotationStyle = "highlight";
+	private penBtn: HTMLButtonElement | null = null;
+	private rectangleBtn: HTMLButtonElement | null = null;
+	private activeAnnotationId: string | null = null;
+	private textTool: AnnotationStyle | null = null;
+	private savingHighlight = false;
 	private popupColor = "yellow";
 	private editingNoteId: string | null = null;
 
 	// drawing tool state
+	private drawingController: DrawingController | null = null;
 	private drawingTool: DrawingTool = null;
-	private penWidthIndex = 1; // 0 thin / 1 medium / 2 thick
+	private penWidth = 4;
+	private penMenuEl: HTMLElement | null = null;
+	private penMenuFlush: (() => void | Promise<void>) | null = null;
+	private inkWidthBefore: { annotation: Annotation; token: number } | null = null;
 	private liveStroke: LiveStroke | null = null;
 	private liveStrokePage = 0;
 	private selectedInkId: string | null = null;
@@ -123,9 +132,11 @@ export class PaperReaderView extends ItemView {
 
 	// reading position persistence
 	private positionTimer: number | null = null;
+	private lastReadingPosition: ReadingPosition | null = null;
 	private restoringPosition = false;
 
 	// in-document search
+	private searchController: SearchController | null = null;
 	private searchBarEl: HTMLElement | null = null;
 	private searchInputEl: HTMLInputElement | null = null;
 	private searchCountEl: HTMLElement | null = null;
@@ -133,6 +144,11 @@ export class PaperReaderView extends ItemView {
 	private currentHit = -1;
 	private searchToken = 0;
 	private searchDebounce: number | null = null;
+	private searchReturnFocus: HTMLElement | null = null;
+	private wheelZoomTimer: number | null = null;
+	private wheelZoomFactor = 1;
+	private wheelZoomPoint = { x: 0, y: 0 };
+	private wheelZoomRunning = false;
 
 	constructor(leaf: WorkspaceLeaf, plugin: PaperReaderPlugin) {
 		super(leaf);
@@ -149,23 +165,28 @@ export class PaperReaderView extends ItemView {
 		this.popup = new SelectionPopup({
 			getColors: () => this.plugin.settings.highlightColors,
 			getStyle: () => this.popupStyle,
+			getPageLabel: page => this.pageLabels?.[page - 1] ?? String(page),
+			onDismiss: () => { this.activeAnnotationId = null; this.editingNoteId = null; this.redrawAllHighlights(); },
 			setStyle: (style) => void this.setPopupStyle(style),
-			setInkWidth: (width) => void this.setPopupInkWidth(width),
+			setInkWidth: (width, commit, id) => this.setPopupInkWidth(width, commit, id),
 			applyAnnotation: (color) => void this.applyPopupAnnotation(color),
 			copySelection: () => void this.copySelection(),
+			onNote: () => void this.openNotePopup(),
+			onExplain: payload => void this.openAiPanel("explain", payload),
 			submitNote: (text) => this.submitNote(text),
 			deleteAnnotation: (id) => this.deleteHighlight(id),
-			translate: (payload, onChunk) => this.translateForPopup(payload, onChunk),
+			translate: (payload, onChunk, signal) => this.translateForPopup(payload, onChunk, signal),
 			insertTranslation: (t) => this.insertPopupTranslation(t),
 			getCached: (key) => this.popupCache.get(key),
 			setCached: (key, state) => this.popupCache.merge(key, state),
-		});
+		}, () => this.contentEl.ownerDocument);
 		this.hlMenu = new HighlightMenu(
 			{
 				onRecolor: (color) => void this.recolorHighlight(color),
 				onDelete: () => void this.deleteHighlight(),
 			},
-			() => this.plugin.settings.highlightColors
+			() => this.plugin.settings.highlightColors,
+			() => this.contentEl.ownerDocument
 		);
 		this.sidebar = new ThumbnailSidebar(this.renderer, {
 			onSelect: (page) => void this.scrollToPage(page),
@@ -230,10 +251,13 @@ export class PaperReaderView extends ItemView {
 		);
 		this.bodyEl.appendChild(this.panel.el);
 
+		this.scrollEl.tabIndex = -1;
+		this.registerDomEvent(this.scrollEl, "wheel", (e: WheelEvent) => this.onZoomWheel(e), { passive: false });
 		this.registerDomEvent(this.scrollEl, "scroll", () => {
-			this.popup.hide();
+			this.repositionPopup();
 			this.hlMenu.hide();
 			this.updateCurrentPageFromScroll();
+			this.updateDetails();
 			this.schedulePositionSave();
 			if (this.pageWindowTimer === null) this.pageWindowTimer = window.setTimeout(() => {
 				this.pageWindowTimer = null;
@@ -246,27 +270,37 @@ export class PaperReaderView extends ItemView {
 			this.onPenPointerDown(e)
 		);
 		this.registerDomEvent(this.scrollEl, "pointermove", (e: PointerEvent) => {
+			if (this.rangeDrag) { this.moveRangeEndpoint(e); return; }
 			this.onPenPointerMove(e);
 			if (!this.drawingTool && (e.buttons & 1) !== 0 && this.pagesEl.contains(e.target as Node)) {
 				this.scheduleSelectionPreview();
 			}
 		});
 		this.registerDomEvent(this.scrollEl, "pointerup", (e: PointerEvent) =>
-			this.onPenPointerEnd(e, true)
+			{
+				if (this.rangeDrag) { this.rangeDrag = null; void this.saveRangeEdit(); }
+				else this.onPenPointerEnd(e, true);
+			}
 		);
 		this.registerDomEvent(this.scrollEl, "pointercancel", (e: PointerEvent) =>
-			this.onPenPointerEnd(e, false)
+			{ this.rangeDrag = null; this.cancelRangeEdit(); this.onPenPointerEnd(e, false); }
 		);
 		// track selection lifecycle to enable/disable the header action group
-		this.registerDomEvent(document, "selectionchange", () => {
+		this.registerDomEvent(this.contentEl.ownerDocument, "selectionchange", () => {
 			if (this.closed) return;
 			// Keep the custom selection preview current during keyboard selection.
 			this.scheduleSelectionPreview();
 			if (this.selectionTimer !== null) window.clearTimeout(this.selectionTimer);
 			this.selectionTimer = window.setTimeout(() => this.refreshSelectionState(), 100);
 		});
-		this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => {
+		this.registerDomEvent(this.contentEl.ownerDocument, "keydown", (e: KeyboardEvent) => {
+			if (e.defaultPrevented) return;
 			if (e.key === "Escape") {
+				if (this.searchBarEl && !this.searchBarEl.hasClass("pr-hidden")) {
+					e.preventDefault(); this.closeSearch(); return;
+				}
+				if (this.textTool) this.setTextTool(null);
+				if (this.editingRangeId) { this.clearSelection(); return; }
 				if (this.rectangleEdit) {
 					this.cancelRectangleEdit();
 					return;
@@ -282,9 +316,11 @@ export class PaperReaderView extends ItemView {
 					return;
 				}
 				this.popup.hide();
+				this.activeAnnotationId = null; this.redrawAllHighlights();
 				this.hlMenu.hide();
 				return;
 			}
+			if (this.editingRangeId && e.key === "Enter" && !e.isComposing) { e.preventDefault(); void this.saveRangeEdit(); return; }
 			// undo/redo: only when this view is active and not typing
 			if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !e.altKey) {
 				if (this.app.workspace.getActiveViewOfType(PaperReaderView) === this && !this.isEditableTarget(e.target)) {
@@ -302,23 +338,47 @@ export class PaperReaderView extends ItemView {
 				}
 				return;
 			}
+			if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing && !this.isEditableTarget(e.target) &&
+				this.app.workspace.getActiveViewOfType(PaperReaderView) === this && e.key.toLowerCase() === "p") {
+				e.preventDefault(); this.setDrawingTool(this.drawingTool === "pen" ? null : "pen"); return;
+			}
 			this.onPageNavKey(e);
 		});
-		this.registerDomEvent(document, "mousedown", (e: MouseEvent) => {
+		this.registerDomEvent(this.contentEl.ownerDocument, "mousedown", (e: MouseEvent) => {
 			const t = e.target as Node;
+			if (this.penMenuEl && !this.penMenuEl.contains(t) && !this.headerEl.contains(t)) this.closePenMenu();
+			if (!this.popup.contains(t) && !this.headerEl.contains(t) && this.activeAnnotationId) { this.activeAnnotationId = null; this.redrawAllHighlights(); }
 			if (this.popup.isVisible && !this.popup.contains(t)) this.popup.hide();
 			if (this.hlMenu.isVisible && !this.hlMenu.contains(t)) this.hlMenu.hide();
 			const el = e.target as Element;
-			if (this.selectedInkId && !el.closest?.(".pr-ink-path, .pr-ink-selection, .pr-ink-handle, .pr-popup")) {
+			if (this.selectedInkId && !el.closest?.(".pr-ink-path, .pr-ink-selection, .pr-ink-handle, .pr-popup, .pr-hl-menu, .pr-header, .pr-pen-popover")) {
 				this.selectedInkId = null;
 				this.editingNoteId = null;
+				this.selectionActions?.refreshIndicator();
 				this.redrawAllInk();
 			}
 		});
+		const win = this.contentEl.ownerDocument.defaultView!;
+		let density = win.matchMedia(`(resolution: ${win.devicePixelRatio}dppx)`);
+		const densityChanged = () => {
+			density.removeEventListener("change", densityChanged);
+			density = win.matchMedia(`(resolution: ${win.devicePixelRatio}dppx)`);
+			density.addEventListener("change", densityChanged);
+			if (!this.closed) void this.renderAll();
+		};
+		density.addEventListener("change", densityChanged);
+		this.register(() => density.removeEventListener("change", densityChanged));
+
 	}
 
 	async onClose(): Promise<void> {
+		this.closePenMenu();
+		this.popup.hide();
 		this.closed = true;
+		if (this.wheelZoomTimer !== null) window.clearTimeout(this.wheelZoomTimer);
+		this.wheelZoomTimer = null; this.wheelZoomFactor = 1;
+		this.passwordModal?.close();
+		this.cancelRangeEdit();
 		this.panel?.close();
 		this.documentToken++;
 		this.renderToken++;
@@ -362,6 +422,7 @@ export class PaperReaderView extends ItemView {
 		state: {
 			file?: string;
 			page?: number;
+			annotation?: string;
 			sidebarCollapsed?: boolean;
 			sidebarMode?: SidebarMode;
 			followOutline?: boolean;
@@ -386,21 +447,29 @@ export class PaperReaderView extends ItemView {
 		if (state.file) {
 			const file = this.app.vault.getAbstractFileByPath(state.file);
 			if (file instanceof TFile && file.extension === "pdf") {
-				await this.openFile(file, { page: state.page });
+				await this.openFile(file, { page: state.page, annotation: state.annotation });
 			} else {
-				this.showEmpty(`文件不存在或不是 PDF: ${state.file}`);
+				this.showEmpty(t("文件不存在或不是 PDF: {path}", { path: state.file }));
 			}
 		}
 		await super.setState(state, result);
 	}
 
-	async openFile(file: TFile, opts?: { page?: number }): Promise<void> {
+	async openFile(file: TFile, opts?: { page?: number; annotation?: string }): Promise<void> {
+		this.closePenMenu();
+		this.popup.hide();
+		this.inkWidthBefore = null;
+		this.passwordModal?.close();
 		const token = ++this.documentToken;
 		this.panel?.close();
 		this.file = file;
+		this.lastReadingPosition = null;
 		this.currentPayload = null;
 		this.editingNoteId = null;
 		this.popupCache.clear();
+		this.pendingNoteIds = [];
+		this.navigationBack = [];
+		this.cancelRangeEdit();
 		this.selectedInkId = null;
 		this.setDrawingTool(null);
 		this.history.clear();
@@ -408,11 +477,12 @@ export class PaperReaderView extends ItemView {
 		this.currentPage = 1;
 		this.popup.hide();
 		this.hlMenu.hide();
-		this.showEmpty("加载中…");
+		this.showEmpty(t("加载中…"));
 		try {
 			const buf = await this.app.vault.readBinary(file);
 			if (token !== this.documentToken || this.closed) return;
-			await this.renderer.load(buf);
+			await this.renderer.load(buf, { ownerDocument: this.contentEl.ownerDocument,
+				onPassword: (update, reason) => this.requestPdfPassword(update, reason) });
 			if (token !== this.documentToken || this.closed) return;
 			const store = new AnnotationStore(this.app, () => this.plugin.settings.annotationSuffix);
 			const data = await store.load(file.path);
@@ -422,10 +492,11 @@ export class PaperReaderView extends ItemView {
 			const outline = await this.renderer.getOutline().catch(() => null);
 			if (token !== this.documentToken || this.closed) return;
 			this.baseDims = dims; this.outline = outline;
+			this.pageLabels = await this.renderer.getPageLabels();
 		} catch (e) {
 			if (token !== this.documentToken || this.closed) return;
 			console.error("[paper-reader] failed to load pdf", e);
-			this.showEmpty(`PDF 加载失败: ${file.path}`);
+			this.showEmpty(t("PDF 加载失败: {path}", { path: file.path }));
 			return;
 		}
 		if (token !== this.documentToken || this.closed) return;
@@ -446,8 +517,111 @@ export class PaperReaderView extends ItemView {
 		} else if (saved) {
 			await this.restorePosition(saved);
 		}
+		if (opts?.annotation) {
+			const ann = this.data.annotations.find(a => a.id === opts.annotation);
+			if (ann) await this.jumpToAnnotation(ann);
+		}
 		// refresh leaf tab title
-		(this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
+		refreshLeafHeader(this.leaf);
+		this.lastReadingPosition = this.currentPosition();
+	}
+
+
+	private pageCountLabel(): string {
+		return `${this.currentPage} / ${this.renderer.numPages}`;
+	}
+
+	private requestPdfPassword(update: (password: string) => void, reason: number): void {
+		const modal = new Modal(this.app);
+		this.passwordModal = modal;
+		modal.titleEl.setText(reason === 2 ? t("密码错误，请重试") : t("此 PDF 需要密码"));
+		const input = modal.contentEl.createEl("input", { attr: { type: "password", "aria-label": t("PDF 密码") } });
+		let accepted = false;
+		const submit = () => { accepted = true; update(input.value); modal.close(); };
+		modal.contentEl.createEl("button", { text: t("打开") }).addEventListener("click", submit);
+		input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing) submit(); });
+		modal.onClose = () => {
+			if (this.passwordModal === modal) this.passwordModal = null;
+			if (!accepted) void this.renderer.destroy();
+		};
+		this.register(() => { accepted = true; modal.close(); });
+		modal.open(); input.focus();
+	}
+
+	private rememberNavigation(): void {
+		const position = this.currentPosition();
+		if (position) { this.navigationBack.push(position); if (this.navigationBack.length > 30) this.navigationBack.shift(); }
+	}
+
+	private async goBack(): Promise<void> {
+		const position = this.navigationBack.pop();
+		if (!position) return;
+		if (this.layoutMode === "single") await this.scrollToPage(position.page);
+		await this.restorePosition(position);
+	}
+
+	private async followPdfLink(dest: string | unknown[]): Promise<void> {
+		const token = this.documentToken;
+		const page = await this.renderer.resolveDestination(dest);
+		if (page === null || token !== this.documentToken || this.closed) return;
+		this.rememberNavigation();
+		this.clearSelection();
+		await this.scrollToPage(page);
+	}
+
+	private scrollToRect(pageNumber: number, rect?: { x: number; y: number; width: number; height: number }): void {
+		const page = this.pages.find(p => p.pageNumber === pageNumber);
+		if (!page || !rect) return;
+		const pageBounds = page.wrapper.getBoundingClientRect(), viewBounds = this.scrollEl.getBoundingClientRect();
+		this.scrollEl.scrollTop += pageBounds.top + rect.y * this.scale - viewBounds.top - this.scrollEl.clientHeight / 3;
+		this.scrollEl.scrollLeft += Math.max(0, pageBounds.left + rect.x * this.scale - viewBounds.right + rect.width * this.scale + 16);
+	}
+
+	private updateDetails(): void {
+		const bounds = this.scrollEl.getBoundingClientRect();
+		for (const page of this.pages) if (this.mountedPages.has(page.pageNumber)) void this.renderer.updateDetail(page, bounds).catch(error => console.error("[paper-reader] detail render failed", error));
+	}
+
+	private repositionPopup(): void {
+		if (!this.popup.isVisible) return;
+		const id = this.editingNoteId;
+		const ann = id ? this.data.annotations.find(a => a.id === id) : null;
+		const selection = this.activeTextSelection();
+		if (ann) {
+			const page = this.pages.find(p => p.pageNumber === ann.page), rect = ann.rects[0];
+			if (page && rect) {
+				const bounds = page.wrapper.getBoundingClientRect();
+				this.popup.reposition(new DOMRect(bounds.left + rect.x * this.scale, bounds.top + rect.y * this.scale, rect.width * this.scale, rect.height * this.scale));
+			}
+		} else if (selection) this.popup.reposition(selection.getRangeAt(0).getBoundingClientRect());
+	}
+
+	private annotationsForPayload(payload: SelectionPayload, fields: Parameters<typeof annotationFromPayload>[1]): Annotation[] {
+		const annotations = (payload.segments ?? [payload]).map(segment => annotationFromPayload(segment, fields));
+		if (annotations.length > 1) for (const ann of annotations) ann.groupId = annotations[0].id;
+		return annotations;
+	}
+
+	private annotationGroup(ann: Annotation): Annotation[] {
+		return ann.groupId ? this.data.annotations.filter(a => a.groupId === ann.groupId) : [ann];
+	}
+
+	private recordAdded(annotations: Annotation[]): void {
+		const ops: HistoryOp[] = annotations.map(ann => ({ kind: "add", ann: cloneAnnotation(ann) }));
+		this.history.push(ops.length === 1 ? ops[0] : { kind: "batch", ops });
+	}
+
+	private recordUpdates(before: Annotation[], after: Annotation[]): void {
+		const ops: HistoryOp[] = before.map((ann, i) => ({ kind: "update", before: ann, after: cloneAnnotation(after[i]) }));
+		this.history.push(ops.length === 1 ? ops[0] : { kind: "batch", ops });
+	}
+
+	private async updateGroup(ann: Annotation, fields: Partial<Annotation>): Promise<boolean> {
+		const group = this.annotationGroup(ann), before = group.map(a => cloneAnnotation(a));
+		for (const item of group) Object.assign(item, fields);
+		if (!(await this.persistAndRefresh())) { group.forEach((item, i) => Object.assign(item, before[i])); return false; }
+		this.recordUpdates(before, group);
+		return true;
 	}
 
 	// ---- reading position persistence ----
@@ -458,13 +632,11 @@ export class PaperReaderView extends ItemView {
 	 * only). Page is clamped for PDFs that lost pages.
 	 */
 	private prepareSavedLayout(saved: ReadingPosition): void {
-		this.layoutMode = (saved.layoutMode as LayoutMode) ?? "continuous";
-		this.zoomMode = (saved.zoomMode as ZoomMode) ?? "fit-width";
-		if (this.zoomMode === "manual" && saved.scale > 0) this.scale = saved.scale;
-		this.currentPage = Math.min(
-			Math.max(1, Math.round(saved.page)),
-			Math.max(this.renderer.numPages, 1)
-		);
+		const position = ReadingPositionManager.normalize(saved, this.renderer.numPages);
+		this.layoutMode = position.layoutMode as LayoutMode;
+		this.zoomMode = position.zoomMode as ZoomMode;
+		if (this.zoomMode === "manual") this.scale = position.scale;
+		this.currentPage = position.page;
 	}
 
 	private savedPositionFor(path: string): ReadingPosition | undefined {
@@ -474,27 +646,14 @@ export class PaperReaderView extends ItemView {
 	}
 
 	private currentPosition(): ReadingPosition | null {
-		if (!this.file || this.pages.length === 0) return null;
-		const mid = this.scrollEl.scrollTop + this.scrollEl.clientHeight / 2;
-		let page = this.pages[0];
-		for (const p of this.pages) {
-			if (p.wrapper.offsetTop <= mid) page = p;
-			else break;
-		}
-		const h = page.wrapper.offsetHeight || 1;
-		const fraction = Math.min(Math.max((mid - page.wrapper.offsetTop) / h, 0), 1);
-		return {
-			page: page.pageNumber,
-			pageFraction: fraction,
-			zoomMode: this.zoomMode,
-			scale: this.scale,
-			layoutMode: this.layoutMode,
-			updatedAt: Date.now(),
-		};
+		if (!this.file || !this.scrollEl.clientHeight || !this.pages[0]?.wrapper.offsetHeight) return null;
+		return ReadingPositionManager.capture(this.pages, this.scrollEl.scrollTop, this.scrollEl.clientHeight,
+			{ zoomMode: this.zoomMode, scale: this.scale, layoutMode: this.layoutMode });
 	}
 
 	private schedulePositionSave(): void {
 		if (!this.file || this.restoringPosition) return;
+		this.lastReadingPosition = this.currentPosition() ?? this.lastReadingPosition;
 		if (this.positionTimer !== null) window.clearTimeout(this.positionTimer);
 		this.positionTimer = window.setTimeout(() => {
 			this.positionTimer = null;
@@ -503,8 +662,10 @@ export class PaperReaderView extends ItemView {
 	}
 
 	private async savePositionNow(): Promise<void> {
-		const pos = this.currentPosition();
+		const pos = (this.closed ? null : this.currentPosition()) ?? this.lastReadingPosition;
 		if (!pos || !this.file) return;
+		// A pending debounce must not resurrect a deleted document record.
+		if (this.app.vault.getAbstractFileByPath && !this.app.vault.getAbstractFileByPath(this.file.path)) return;
 		this.plugin.settings.readingPositions[this.file.path] = pos;
 		await this.plugin.saveSettings();
 	}
@@ -512,15 +673,11 @@ export class PaperReaderView extends ItemView {
 	private async restorePosition(saved: ReadingPosition): Promise<void> {
 		this.restoringPosition = true;
 		try {
-			const n = this.renderer.numPages;
-			const page = Math.min(Math.max(1, Math.round(saved.page)), Math.max(n, 1));
-			const rendered = this.pages.find((p) => p.pageNumber === page);
+			const position = ReadingPositionManager.normalize(saved, this.renderer.numPages);
+			const page = position.page;
+			const rendered = this.pages.find(p => p.pageNumber === page);
 			if (!rendered) return;
-			const target =
-				rendered.wrapper.offsetTop +
-				saved.pageFraction * rendered.wrapper.offsetHeight -
-				this.scrollEl.clientHeight / 2;
-			this.scrollEl.scrollTop = Math.max(0, target);
+			this.scrollEl.scrollTop = ReadingPositionManager.scrollTop(rendered, position.pageFraction, this.scrollEl.clientHeight);
 			this.updateCurrentPage(page);
 			await this.refreshPageWindow();
 		} finally {
@@ -535,7 +692,7 @@ export class PaperReaderView extends ItemView {
 		this.searchBarEl = bar;
 		this.searchInputEl = bar.createEl("input", {
 			cls: "pr-search-input",
-			attr: { type: "text", placeholder: "在本文档中搜索…" },
+			attr: { type: "text", placeholder: t("在本文档中搜索…") },
 		});
 		this.searchCountEl = bar.createSpan({ cls: "pr-search-count" });
 		const mkBtn = (icon: string, tooltip: string, onClick: () => void) => {
@@ -545,9 +702,9 @@ export class PaperReaderView extends ItemView {
 			btn.addEventListener("mousedown", (e) => e.preventDefault());
 			btn.addEventListener("click", onClick);
 		};
-		mkBtn("chevron-up", "上一个 (Shift+Enter)", () => void this.gotoHit(-1));
-		mkBtn("chevron-down", "下一个 (Enter)", () => void this.gotoHit(1));
-		mkBtn("x", "关闭 (Esc)", () => this.closeSearch());
+		mkBtn("chevron-up", t("上一个 (Shift+Enter)"), () => void this.gotoHit(-1));
+		mkBtn("chevron-down", t("下一个 (Enter)"), () => void this.gotoHit(1));
+		mkBtn("x", t("关闭 (Esc)"), () => this.closeSearch());
 		this.searchInputEl.addEventListener("input", () => {
 			if (this.searchDebounce !== null) window.clearTimeout(this.searchDebounce);
 			this.searchDebounce = window.setTimeout(() => void this.runSearch(), 250);
@@ -565,6 +722,10 @@ export class PaperReaderView extends ItemView {
 
 	private openSearch(): void {
 		if (!this.searchBarEl || !this.file) return;
+		if (this.searchBarEl.hasClass("pr-hidden")) {
+			const active = this.contentEl.ownerDocument.activeElement;
+			this.searchReturnFocus = active !== this.contentEl.ownerDocument.body ? active as HTMLElement | null : null;
+		}
 		this.searchBarEl.removeClass("pr-hidden");
 		this.searchInputEl?.focus();
 		this.searchInputEl?.select();
@@ -582,6 +743,10 @@ export class PaperReaderView extends ItemView {
 		this.searchToken++;
 		this.clearSearchHighlights();
 		if (this.searchCountEl) this.searchCountEl.setText("");
+		const focus = this.searchReturnFocus;
+		this.searchReturnFocus = null;
+		if (!this.closed && focus?.isConnected) focus.focus({ preventScroll: true });
+		else if (!this.closed) this.scrollEl?.focus({ preventScroll: true });
 	}
 
 	private clearSearchHighlights(): void {
@@ -592,78 +757,27 @@ export class PaperReaderView extends ItemView {
 		}
 	}
 
-	private async runSearch(): Promise<void> {
-		const token = ++this.searchToken;
-		this.clearSearchHighlights();
-		this.searchHits = [];
-		this.currentHit = -1;
-		const query = this.searchInputEl?.value ?? "";
-		const countEl = this.searchCountEl;
-		if (!this.file || !query.trim()) {
-			if (countEl) countEl.setText("");
-			return;
+	private getSearchController(): SearchController {
+		if (!this.searchController) {
+			const view = this;
+			this.searchController = new SearchController({
+				get token() { return view.searchToken; }, set token(value) { view.searchToken = value; },
+				get hits() { return view.searchHits; }, set hits(value) { view.searchHits = value; },
+				get current() { return view.currentHit; }, set current(value) { view.currentHit = value; },
+			}, {
+				renderer: this.renderer, input: () => this.searchInputEl, count: () => this.searchCountEl,
+				hasFile: () => !!this.file, pages: () => this.pages, scale: () => this.scale,
+				clearHighlights: () => this.clearSearchHighlights(), rememberNavigation: () => this.rememberNavigation(),
+				scrollToPage: page => this.scrollToPage(page), domRangeForText: (wrapper, start, length) => this.domRangeForText(wrapper, start, length),
+				scrollToRect: (page, rect) => this.scrollToRect(page, rect),
+			});
 		}
-		if (countEl) countEl.setText("搜索中…");
-		const n = this.renderer.numPages;
-		const texts: (string | undefined)[] = [];
-		for (let p = 1; p <= n; p++) {
-			if (token !== this.searchToken) return; // superseded
-			try {
-				texts.push(await this.renderer.getPageTextEnsured(p));
-			} catch {
-				texts.push(undefined);
-			}
-		}
-		if (token !== this.searchToken) return;
-		if (texts.every((t) => !t || !t.trim())) {
-			if (countEl) countEl.setText("无法提取文本（可能是扫描件）");
-			return;
-		}
-		this.searchHits = findHits(texts, query);
-		if (this.searchHits.length === 0) {
-			if (countEl) countEl.setText("无结果");
-			return;
-		}
-		await this.gotoHit(1, true);
+		return this.searchController;
 	}
 
-	private async gotoHit(dir: number, absolute = false): Promise<void> {
-		const total = this.searchHits.length;
-		if (total === 0) return;
-		this.currentHit = absolute
-			? 0
-			: (((this.currentHit + dir) % total) + total) % total;
-		const hit = this.searchHits[this.currentHit];
-		if (this.searchCountEl) {
-			this.searchCountEl.setText(`${this.currentHit + 1} / ${total}`);
-		}
-		await this.scrollToPage(hit.page);
-		this.applySearchHighlights(hit);
-	}
-
-	/** map hit char offsets to DOM ranges and draw temporary highlight rects */
-	private applySearchHighlights(current: SearchHit): void {
-		this.clearSearchHighlights();
-		const page = this.pages.find((p) => p.pageNumber === current.page);
-		if (!page) return;
-		const layer = page.highlightLayer;
-		const hitsOnPage = this.searchHits.filter((h) => h.page === current.page);
-		for (const hit of hitsOnPage) {
-			const range = this.domRangeForText(page.wrapper, hit.index, hit.length);
-			if (!range) continue;
-			const pageRect = page.wrapper.getBoundingClientRect();
-			for (const r of mergeTextRects(textRangeRects(range, page.wrapper))) {
-				if (r.width < 2 || r.height < 2) continue;
-				const el = layer.createDiv({
-					cls: hit === current ? "pr-search-hit pr-search-current" : "pr-search-hit",
-				});
-				el.style.left = `${r.left - pageRect.left}px`;
-				el.style.top = `${r.top - pageRect.top}px`;
-				el.style.width = `${r.width}px`;
-				el.style.height = `${r.height}px`;
-			}
-		}
-	}
+	private runSearch(): Promise<void> { return this.getSearchController().run(); }
+	private gotoHit(dir: number, absolute = false): Promise<void> { return this.getSearchController().goto(dir, absolute); }
+	private applySearchHighlights(current: SearchHit): void { this.getSearchController().applyHighlights(current); }
 
 	/** locate [start, start+length) of the page's extracted text inside the text layer DOM */
 	private domRangeForText(
@@ -673,25 +787,7 @@ export class PaperReaderView extends ItemView {
 	): Range | null {
 		const textLayer = pageWrapper.querySelector(".textLayer");
 		if (!textLayer) return null;
-		const walker = document.createTreeWalker(textLayer, NodeFilter.SHOW_TEXT);
-		const range = document.createRange();
-		let acc = 0;
-		let started = false;
-		let node = walker.nextNode();
-		while (node) {
-			const len = node.textContent?.length ?? 0;
-			if (!started && acc + len > start) {
-				range.setStart(node, Math.min(start - acc, len));
-				started = true;
-			}
-			if (started && acc + len >= start + length) {
-				range.setEnd(node, Math.min(start + length - acc, len));
-				return range;
-			}
-			acc += len;
-			node = walker.nextNode();
-		}
-		return started ? range : null;
+		return mappedTextRange(textLayer, start, length);
 	}
 
 	private showEmpty(message: string): void {
@@ -715,47 +811,38 @@ export class PaperReaderView extends ItemView {
 			tooltip: string,
 			onClick: (e: MouseEvent) => void
 		): HTMLButtonElement => {
-			const btn = this.headerEl.createEl("button", { cls: "pr-header-btn clickable-icon" });
-			btn.setAttr("aria-label", tooltip);
+			const btn = buttonParent.createEl("button", { cls: "pr-header-btn clickable-icon" });
 			setIcon(btn, icon);
+			btn.createSpan({ cls: "pr-sr-only", text: tooltip });
 			btn.addEventListener("click", (e) => onClick(e));
 			return btn;
 		};
 
-		// sidebar toggle + options dropdown
-		mkBtn("panel-left", "切换侧栏", () => void this.toggleSidebar());
-		mkBtn("chevron-down", "侧栏选项", (e) => this.openSidebarMenu(e));
-
-		this.headerEl.createDiv({ cls: "pr-divider" });
-
-		// zoom out / zoom in + options dropdown
-		mkBtn("zoom-out", "缩小", () => void this.zoomBy(1 / 1.2));
-		mkBtn("zoom-in", "放大", () => void this.zoomBy(1.2));
-		mkBtn("chevron-down", "缩放与布局选项", (e) => this.openZoomMenu(e));
-
-		// pen tool + width dropdown
-		this.penBtn = mkBtn("pencil", "画笔（再次点击或 Esc 退出）", () =>
-			this.setDrawingTool(this.drawingTool === "pen" ? null : "pen")
-		);
-		this.penBtn.toggleClass("pr-pen-on", this.drawingTool === "pen");
-		this.rectangleBtn = mkBtn("square", "矩形框（再次点击或 Esc 退出）", () =>
-			this.setDrawingTool(this.drawingTool === "rectangle" ? null : "rectangle")
-		);
-		this.rectangleBtn.toggleClass("pr-pen-on", this.drawingTool === "rectangle");
-		mkBtn("chevron-down", "画笔粗细", (e) => this.openPenMenu(e));
-
-		// undo / redo
-		this.undoBtn = mkBtn("undo-2", "撤销 (Cmd/Ctrl+Z)", () => void this.history.undo());
-		this.redoBtn = mkBtn("redo-2", "重做 (Cmd/Ctrl+Shift+Z)", () => void this.history.redo());
-		this.updateHistoryButtons();
-
-		this.headerEl.createDiv({ cls: "pr-divider" });
+		const start = this.headerEl.createDiv({ cls: "pr-header-start" });
+		const center = this.headerEl.createDiv({ cls: "pr-header-center" });
+		const end = this.headerEl.createDiv({ cls: "pr-header-end" });
+		let buttonParent = start;
+		mkBtn("panel-left", t("切换侧栏"), () => void this.toggleSidebar());
+		mkBtn("chevron-down", t("侧栏选项"), (e) => this.openSidebarMenu(e));
+		start.createDiv({ cls: "pr-divider" });
+		mkBtn("zoom-out", t("缩小"), () => void this.zoomBy(1 / 1.2));
+		mkBtn("zoom-in", t("放大"), () => void this.zoomBy(1.2));
+		mkBtn("move-horizontal", t("适应宽度"), () => void this.setZoomMode("fit-width"));
+		mkBtn("chevron-down", t("缩放与布局选项"), (e) => this.openZoomMenu(e));
+		start.createDiv({ cls: "pr-divider" });
+		mkBtn("undo-2", t("返回上一阅读位置"), () => void this.goBack());
+		mkBtn("chevron-up", t("上一页"), () => void this.scrollToPage(this.currentPage - 1));
+		mkBtn("chevron-down", t("下一页"), () => void this.scrollToPage(this.currentPage + 1));
 
 		// selection action group
 		this.selectionActions = new SelectionActions(
 			{
-				getColor: () => this.popupColor,
+				getColor: () => this.data.annotations.find(a => a.id === this.selectedInkId && a.ink)?.color ?? this.popupColor,
 				getStyle: () => this.popupStyle,
+				getMode: () => this.textTool,
+				isDrawing: () => this.drawingTool !== null,
+				canPickColor: () => !!(this.textTool || this.drawingTool || this.currentPayload || this.data.annotations.some(a => a.id === this.selectedInkId && a.ink)),
+				setMode: (style) => this.setTextTool(style),
 				applyColor: (key) => void this.applyHeaderColor(key),
 				applyStyle: (style) => void this.applyHeaderStyle(style),
 				onClearHighlight: () => void this.clearHighlightsInSelection(),
@@ -768,44 +855,66 @@ export class PaperReaderView extends ItemView {
 			() => this.plugin.settings.highlightColors
 		);
 		this.selectionActions.setEnabled(!!this.currentPayload);
-		this.headerEl.appendChild(this.selectionActions.el);
+		center.appendChild(this.selectionActions.el);
+		end.appendChild(this.selectionActions.secondaryEl);
 
-		// page number input, pinned right
-		const pageWrap = this.headerEl.createDiv({ cls: "pr-page-wrap" });
+		// PDF label followed by physical page / total, beside page navigation
+		const pageWrap = start.createDiv({ cls: "pr-page-wrap" });
 		this.pageInputEl = pageWrap.createEl("input", {
 			cls: "pr-page-input",
-			attr: { type: "text", inputmode: "numeric" },
+			attr: { type: "text", id: `pr-page-${crypto.randomUUID()}` },
 		});
-		this.pageInputEl.value = String(this.currentPage);
+		pageWrap.createEl("label", { cls: "pr-sr-only", text: t("页码"), attr: { for: this.pageInputEl.id } });
+		this.pageInputEl.value = this.pageLabels?.[this.currentPage - 1] ?? String(this.currentPage);
 		this.pageInputEl.addEventListener("keydown", (e: KeyboardEvent) => {
-			if (e.key === "Enter") {
-				const n = parseInt(this.pageInputEl?.value ?? "", 10);
-				if (Number.isFinite(n)) void this.scrollToPage(n);
+			if (e.key === "Enter" && !e.isComposing) {
+				const value = this.pageInputEl?.value.trim() ?? "";
+				const labelIndex = this.pageLabels?.indexOf(value) ?? -1;
+				const n = labelIndex >= 0 ? labelIndex + 1 : Number(value);
+				if (value && Number.isInteger(n)) void this.scrollToPage(n);
 				this.pageInputEl?.blur();
 			}
 			e.stopPropagation();
 		});
 		this.pageInputEl.addEventListener("blur", () => {
-			if (this.pageInputEl) this.pageInputEl.value = String(this.currentPage);
+			if (this.pageInputEl) this.pageInputEl.value = this.pageLabels?.[this.currentPage - 1] ?? String(this.currentPage);
 		});
 		this.pageTotalEl = pageWrap.createSpan({
 			cls: "pr-page-total",
-			text: `/ ${this.renderer.numPages}`,
+			text: this.pageCountLabel(),
 		});
+		buttonParent = center;
+		this.rectangleBtn = mkBtn("scan", t("矩形框（再次点击或 Esc 退出）"), () =>
+			this.setDrawingTool(this.drawingTool === "rectangle" ? null : "rectangle"));
+		this.rectangleBtn.toggleClass("pr-pen-on", this.drawingTool === "rectangle");
+		this.rectangleBtn.setAttr("aria-pressed", String(this.drawingTool === "rectangle"));
+		this.penBtn = mkBtn("pencil", t("画笔（P 切换，Esc 退出）"), () =>
+			this.setDrawingTool(this.drawingTool === "pen" ? null : "pen"));
+		this.penBtn.toggleClass("pr-pen-on", this.drawingTool === "pen");
+		this.penBtn.setAttr("aria-pressed", String(this.drawingTool === "pen"));
+		mkBtn("chevron-down", t("画笔粗细"), e => this.openPenMenu(e));
+		center.createDiv({ cls: "pr-divider" });
+		center.appendChild(this.selectionActions.colorButton);
+		center.createDiv({ cls: "pr-divider" });
+		this.undoBtn = mkBtn("undo-2", t("撤销 (Cmd/Ctrl+Z)"), () => void this.history.undo());
+		this.redoBtn = mkBtn("redo-2", t("重做 (Cmd/Ctrl+Shift+Z)"), () => void this.history.redo());
+		this.updateHistoryButtons();
+		buttonParent = end;
+		mkBtn("search", t("搜索文档 (Cmd/Ctrl+F)"), () => this.openSearch());
 	}
 
 	private openSidebarMenu(e: MouseEvent): void {
 		const menu = new Menu();
 		menu.addItem((item) =>
 			item
-				.setTitle("缩略图")
+				.setTitle(t("缩略图"))
 				.setIcon("image")
 				.setChecked(this.sidebarMode === "thumbs")
 				.onClick(() => this.setSidebarMode("thumbs"))
 		);
 		menu.addItem((item) =>
 			item
-				.setTitle("目录")
+				.setTitle(t("目录"))
 				.setIcon("list")
 				.setChecked(this.sidebarMode === "outline")
 				.setDisabled(!this.outline || this.outline.length === 0)
@@ -813,7 +922,7 @@ export class PaperReaderView extends ItemView {
 		);
 		menu.addItem((item) =>
 			item
-				.setTitle("标注")
+				.setTitle(t("标注"))
 				.setIcon("list-checks")
 				.setChecked(this.sidebarMode === "annotations")
 				.onClick(() => this.setSidebarMode("annotations"))
@@ -821,7 +930,7 @@ export class PaperReaderView extends ItemView {
 		menu.addSeparator();
 		menu.addItem((item) =>
 			item
-				.setTitle("显示当前所在目录")
+				.setTitle(t("显示当前所在目录"))
 				.setIcon("locate")
 				.setChecked(this.followOutline)
 				.setDisabled(!this.outline || this.outline.length === 0)
@@ -830,56 +939,65 @@ export class PaperReaderView extends ItemView {
 		menu.showAtMouseEvent(e);
 	}
 
+	private closePenMenu(): void {
+		this.penMenuFlush?.(); this.penMenuFlush = null;
+		this.penMenuEl?.remove(); this.penMenuEl = null;
+	}
+
 	private openPenMenu(e: MouseEvent): void {
-		const menu = new Menu();
-		const widths = ["细", "中", "粗"];
-		widths.forEach((label, i) => {
-			menu.addItem((item) =>
-				item
-					.setTitle(label)
-					.setChecked(this.penWidthIndex === i)
-					.onClick(() => this.setPenWidth(i))
-			);
-		});
-		menu.showAtMouseEvent(e);
+		if (this.penMenuEl) { this.closePenMenu(); return; }
+		this.popup.hide();
+		const ann = this.data.annotations.find(a => a.id === this.selectedInkId && a.ink);
+		const id = ann?.id, token = this.documentToken;
+		const el = this.contentEl.ownerDocument.body.createDiv({ cls: "pr-pen-popover pr-popup" });
+		this.penMenuEl = el;
+		this.penMenuFlush = createInkWidthControl(el, ann?.ink?.width ?? this.penWidth,
+			(width, commit) => {
+				if (token !== this.documentToken || this.closed) return;
+				if (id) return this.setPopupInkWidth(width, commit, id);
+				else this.penWidth = width;
+			});
+		el.style.left = `${Math.max(8, Math.min(e.clientX, (el.ownerDocument.defaultView?.innerWidth ?? 1000) - 300))}px`;
+		el.style.top = `${e.clientY + 12}px`;
+		el.addEventListener("keydown", event => { if (event.key === "Escape") { event.stopPropagation(); this.closePenMenu(); } });
 	}
 
 	private openZoomMenu(e: MouseEvent): void {
 		const menu = new Menu();
 		menu.addItem((item) =>
 			item
-				.setTitle("适应宽度")
+				.setTitle(t("适应宽度"))
 				.setChecked(this.zoomMode === "fit-width")
 				.onClick(() => void this.setZoomMode("fit-width"))
 		);
 		menu.addItem((item) =>
 			item
-				.setTitle("适应高度")
+				.setTitle(t("适应高度"))
 				.setChecked(this.zoomMode === "fit-height")
 				.onClick(() => void this.setZoomMode("fit-height"))
 		);
 		menu.addSeparator();
 		menu.addItem((item) =>
 			item
-				.setTitle("连续滚动")
+				.setTitle(t("连续滚动"))
 				.setChecked(this.layoutMode === "continuous")
 				.onClick(() => void this.setLayoutMode("continuous"))
 		);
 		menu.addItem((item) =>
 			item
-				.setTitle("单页")
+				.setTitle(t("单页"))
 				.setChecked(this.layoutMode === "single")
 				.onClick(() => void this.setLayoutMode("single"))
 		);
 		menu.addItem((item) =>
 			item
-				.setTitle("双页（奇数）")
+				.setTitle(t("双页（奇数）"))
 				.setChecked(this.layoutMode === "double-odd")
 				.onClick(() => void this.setLayoutMode("double-odd"))
 		);
 		menu.addItem((item) =>
 			item
-				.setTitle("双页（偶数）")
+				.setTitle(t("双页（偶数）"))
 				.setChecked(this.layoutMode === "double-even")
 				.onClick(() => void this.setLayoutMode("double-even"))
 		);
@@ -887,7 +1005,7 @@ export class PaperReaderView extends ItemView {
 		const isDark = document.body.classList.contains("theme-dark");
 		menu.addItem((item) =>
 			item
-				.setTitle("适应主题（暗色反色）")
+				.setTitle(t("适应主题（暗色反色）"))
 				.setChecked(this.plugin.settings.invertColorsInDark)
 				.setDisabled(!isDark)
 				.onClick(() => void this.toggleInvertColors())
@@ -987,6 +1105,48 @@ export class PaperReaderView extends ItemView {
 		this.schedulePositionSave();
 	}
 
+	/** Chromium delivers trackpad pinch as a Ctrl+wheel event. Batch the gesture and
+	 * keep its PDF point under the cursor; ordinary wheel events remain scrolling. */
+	private onZoomWheel(e: WheelEvent): void {
+		if ((!e.ctrlKey && !e.metaKey) || !this.file || !this.pages.length || e.deltaY === 0) return;
+		e.preventDefault();
+		const delta = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this.scrollEl.clientHeight : 1);
+		this.wheelZoomFactor *= Math.exp(-Math.max(-200, Math.min(200, delta)) * 0.002);
+		this.wheelZoomPoint = { x: e.clientX, y: e.clientY };
+		if (this.wheelZoomTimer !== null) window.clearTimeout(this.wheelZoomTimer);
+		this.wheelZoomTimer = window.setTimeout(() => { this.wheelZoomTimer = null; void this.flushWheelZoom(); }, 50);
+	}
+
+	private async flushWheelZoom(): Promise<void> {
+		if (this.wheelZoomRunning || this.closed || this.wheelZoomFactor === 1) return;
+		const factor = this.wheelZoomFactor, point = this.wheelZoomPoint;
+		this.wheelZoomFactor = 1;
+		const page = this.pages.find(p => {
+			const r = p.wrapper.getBoundingClientRect();
+			return point.x >= r.left && point.x <= r.right && point.y >= r.top && point.y <= r.bottom;
+		}) ?? this.pages.find(p => p.pageNumber === this.currentPage);
+		if (!page) return;
+		const rect = page.wrapper.getBoundingClientRect();
+		const x = (point.x - rect.left) / this.scale, y = (point.y - rect.top) / this.scale;
+		const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, this.scale * factor));
+		if (next === this.scale) return;
+		this.wheelZoomRunning = true;
+		this.zoomMode = "manual"; this.scale = next;
+		try {
+			await this.renderAll(() => {
+				const updated = this.pages.find(p => p.pageNumber === page.pageNumber)?.wrapper.getBoundingClientRect();
+				if (!updated) return;
+				this.scrollEl.scrollLeft += updated.left + x * this.scale - point.x;
+				this.scrollEl.scrollTop += updated.top + y * this.scale - point.y;
+				this.updateCurrentPageFromScroll();
+			});
+			this.schedulePositionSave();
+		} finally {
+			this.wheelZoomRunning = false;
+			if (this.wheelZoomFactor !== 1 && !this.closed) void this.flushWheelZoom();
+		}
+	}
+
 	private async toggleInvertColors(): Promise<void> {
 		this.plugin.settings.invertColorsInDark = !this.plugin.settings.invertColorsInDark;
 		await this.plugin.saveSettings();
@@ -1003,7 +1163,7 @@ export class PaperReaderView extends ItemView {
 
 	// ---- rendering ----
 
-	private async renderAll(): Promise<void> {
+	private async renderAll(onLayout?: () => void): Promise<void> {
 		if (this.closed) return;
 		const token = ++this.renderToken;
 		this.pageRender?.abort.abort();
@@ -1063,6 +1223,7 @@ export class PaperReaderView extends ItemView {
 			}
 			this.updateCurrentPageFromScroll();
 		}
+		onLayout?.();
 		await this.refreshPageWindow();
 	}
 
@@ -1073,7 +1234,7 @@ export class PaperReaderView extends ItemView {
 	): Promise<boolean> {
 		if (token !== this.renderToken) return false;
 		let rendered: RenderedPage;
-		try { rendered = await this.renderer.createPlaceholder(pageNumber, this.scale); }
+		try { rendered = await this.renderer.createPlaceholder(pageNumber, this.scale, this.contentEl.ownerDocument); }
 		catch (error) { if (token !== this.renderToken || this.closed) return false; throw error; }
 		if (token !== this.renderToken) return false;
 		this.pages.push(rendered);
@@ -1085,17 +1246,32 @@ export class PaperReaderView extends ItemView {
 	private async refreshPageWindow(): Promise<void> {
 		if (this.closed || !this.pages.length) return;
 		const bounds = this.scrollEl.getBoundingClientRect();
-		const margin = this.scrollEl.clientHeight;
 		const center = (bounds.top + bounds.bottom) / 2;
-		const candidates = this.pages.map(page => ({ page, rect: page.wrapper.getBoundingClientRect() }))
-			.filter(({ rect }) => rect.bottom >= bounds.top - margin && rect.top <= bounds.bottom + margin)
-			.sort((a, b) => Math.abs((a.rect.top + a.rect.bottom) / 2 - center) - Math.abs((b.rect.top + b.rect.bottom) / 2 - center));
-		// ponytail: eight nearby pages plus active selection/drawing; tune only with viewport evidence.
-		this.wantedPages = new Set(candidates.slice(0, 8).map(({ page }) => page.pageNumber));
+		const geometry = this.pages.map(page => ({ page, rect: page.wrapper.getBoundingClientRect() }));
+		const visiblePages = new Set(geometry.filter(({ rect }) =>
+			rect.bottom > bounds.top && rect.top < bounds.bottom).map(({ page }) => page.pageNumber));
+		if (!visiblePages.size) visiblePages.add(this.currentPage);
+		// Match Zotero's buffer policy: visible pages, immediate neighbors, two recent pages.
+		this.wantedPages = new Set(visiblePages);
+		for (const number of visiblePages) {
+			for (const neighbor of [number + 1, number - 1]) {
+				if (this.pages.some(page => page.pageNumber === neighbor)) this.wantedPages.add(neighbor);
+			}
+			if (this.mountedPages.delete(number)) this.mountedPages.add(number);
+		}
+		const ordered = geometry.filter(({ page }) => this.wantedPages.has(page.pageNumber))
+			.sort((a, b) => Number(visiblePages.has(b.page.pageNumber)) - Number(visiblePages.has(a.page.pageNumber)) ||
+				Math.abs((a.rect.top + a.rect.bottom) / 2 - center) - Math.abs((b.rect.top + b.rect.bottom) / 2 - center));
+		this.wantedPages = new Set(ordered.map(({ page }) => page.pageNumber));
+		const recent = [...this.mountedPages].filter(number => !this.wantedPages.has(number)).slice(-2);
+		for (const number of recent) this.wantedPages.add(number);
 		const selection = this.scrollEl.ownerDocument.getSelection();
+		const editingPages = this.data.annotations.filter(a => a.id === this.editingRangeId || (this.editingRangeId && a.groupId === this.editingRangeId)).map(a => a.page);
+		const selectionRange = selection?.rangeCount && !selection.isCollapsed ? selection.getRangeAt(0) : null;
 		for (const page of this.pages) {
 			if ((selection?.anchorNode && page.wrapper.contains(selection.anchorNode)) ||
 				(selection?.focusNode && page.wrapper.contains(selection.focusNode)) ||
+				selectionRange?.intersectsNode(page.wrapper) || editingPages.includes(page.pageNumber) ||
 				(this.liveStroke && page.pageNumber === this.liveStrokePage) || page.pageNumber === this.rectangleEdit?.page) {
 				this.wantedPages.add(page.pageNumber);
 			}
@@ -1103,20 +1279,26 @@ export class PaperReaderView extends ItemView {
 				this.renderer.releasePage(page); this.mountedPages.delete(page.pageNumber);
 			}
 		}
-		if (this.pageRender && !this.wantedPages.has(this.pageRender.page)) this.pageRender.abort.abort();
+		if (this.pageRender && (!this.wantedPages.has(this.pageRender.page) ||
+			(!visiblePages.has(this.pageRender.page) && [...visiblePages].some(page =>
+				this.wantedPages.has(page) && !this.mountedPages.has(page) && !this.failedPages.has(page))))) {
+			this.pageRender.abort.abort();
+		}
 		if (!this.pageWindowTask) {
 			this.pageWindowTask = Promise.resolve().then(async () => {
 				while (!this.closed) {
-					const slot = this.pages.find(p => this.wantedPages.has(p.pageNumber) && !this.mountedPages.has(p.pageNumber) && !this.failedPages.has(p.pageNumber));
+					const number = [...this.wantedPages].find(p => !this.mountedPages.has(p) && !this.failedPages.has(p));
+					const slot = this.pages.find(p => p.pageNumber === number);
 					if (!slot) break;
 					const token = this.renderToken, abort = new AbortController();
 					this.pageRender = { page: slot.pageNumber, abort };
 					try {
-						const rendered = await this.renderer.renderPage(slot.pageNumber, this.scale, abort.signal);
+						const rendered = await this.renderer.renderPage(slot.pageNumber, this.scale, abort.signal, this.contentEl.ownerDocument, link => { if (link.dest) void this.followPdfLink(link.dest); }, slot);
 						if (token !== this.renderToken || abort.signal.aborted || this.closed) { this.renderer.releasePage(rendered); continue; }
 						const wrapper = slot.wrapper;
-						wrapper.replaceChildren(...Array.from(rendered.wrapper.childNodes));
+						if (wrapper !== rendered.wrapper) wrapper.replaceChildren(...Array.from(rendered.wrapper.childNodes));
 						Object.assign(slot, rendered, { wrapper });
+						this.renderer.adoptPage(rendered, slot);
 						this.mountedPages.add(slot.pageNumber);
 						this.redrawHighlights(slot); this.redrawInk(slot);
 						const hit = this.searchHits[this.currentHit];
@@ -1124,7 +1306,7 @@ export class PaperReaderView extends ItemView {
 					} catch (error) {
 						if (!abort.signal.aborted && token === this.renderToken && !this.closed) {
 							this.failedPages.add(slot.pageNumber);
-							new Notice(`第 ${slot.pageNumber} 页渲染失败，请重新打开 PDF`);
+							this.showPageRenderError(slot);
 							console.error("[paper-reader] page render failed", error);
 						}
 					} finally { this.pageRender = null; }
@@ -1132,6 +1314,20 @@ export class PaperReaderView extends ItemView {
 			}).finally(() => { this.pageWindowTask = null; });
 		}
 		await this.pageWindowTask;
+		this.updateDetails();
+	}
+
+	private showPageRenderError(page: RenderedPage): void {
+		this.renderer.releasePage(page);
+		page.wrapper.querySelector(".pr-page-error")?.remove();
+		const error = page.wrapper.createDiv({ cls: "pr-page-error", attr: { role: "status" } });
+		error.createSpan({ text: t("第 {page} 页渲染失败", { page: page.pageNumber }) });
+		const retry = error.createEl("button", { text: t("重试此页"), attr: { type: "button" } });
+		retry.addEventListener("click", () => {
+			if (this.closed || !this.pages.includes(page)) return;
+			error.remove(); this.failedPages.delete(page.pageNumber);
+			void this.refreshPageWindow();
+		});
 	}
 
 	private redrawHighlights(page: RenderedPage): void {
@@ -1141,23 +1337,19 @@ export class PaperReaderView extends ItemView {
 				(a.type === "highlight" || a.type === "note") &&
 				a.page === page.pageNumber
 		);
+		const selected = this.data.annotations.find(a => a.id === this.activeAnnotationId);
 		renderHighlightRects(
 			page.highlightLayer,
 			annotations,
 			this.scale,
 			this.plugin.settings.highlightColors,
-			(ann, x, y) => this.onAnnotationClick(ann, x, y)
+			(ann, x, y) => this.onAnnotationClick(ann, x, y),
+			selected ? this.annotationGroup(selected).map(a => a.id) : []
 		);
 	}
 
-	/** note annotations reopen the popup for editing; others get the menu */
+	/** A single click selects an existing annotation and opens its comment. */
 	private onAnnotationClick(ann: Annotation, x: number, y: number): void {
-		if (ann.type === "note") {
-			this.editingNoteId = ann.id;
-			this.hlMenu.hide();
-			this.popup.showEdit(ann, x, y);
-			return;
-		}
 		this.openHighlightMenu(ann, x, y);
 	}
 
@@ -1169,11 +1361,11 @@ export class PaperReaderView extends ItemView {
 
 	private updateCurrentPage(page: number): void {
 		this.currentPage = page;
-		if (this.pageInputEl && document.activeElement !== this.pageInputEl) {
-			this.pageInputEl.value = String(page);
+		if (this.pageInputEl && this.contentEl.ownerDocument.activeElement !== this.pageInputEl) {
+			this.pageInputEl.value = this.pageLabels?.[page - 1] ?? String(page);
 		}
 		if (this.pageTotalEl) {
-			this.pageTotalEl.setText(`/ ${this.renderer.numPages}`);
+			this.pageTotalEl.setText(this.pageCountLabel());
 		}
 		this.sidebar.setCurrentPage(page);
 	}
@@ -1216,7 +1408,8 @@ export class PaperReaderView extends ItemView {
 	}
 
 	private onPageNavKey(e: KeyboardEvent): void {
-		if (this.layoutMode !== "single") return;
+		if (this.layoutMode !== "single" || e.defaultPrevented) return;
+		if ((e.target as Element | null)?.closest?.(".pr-popup, .pr-hl-menu, .pr-sidebar, button")) return;
 		if (e.ctrlKey || e.metaKey || e.altKey) return;
 		if (this.isEditableTarget(e.target)) return;
 		// only when this view's leaf is active
@@ -1240,185 +1433,55 @@ export class PaperReaderView extends ItemView {
 			this.liveStroke = null;
 		}
 		this.pagesEl.toggleClass("pr-pen-mode", tool !== null);
+		this.penBtn?.setAttr("aria-pressed", String(tool === "pen"));
+		this.rectangleBtn?.setAttr("aria-pressed", String(tool === "rectangle"));
 		this.penBtn?.toggleClass("pr-pen-on", tool === "pen");
 		this.rectangleBtn?.toggleClass("pr-pen-on", tool === "rectangle");
 		if (tool) {
+			this.textTool = null;
+			this.selectionActions?.refreshIndicator();
 			this.popup.hide();
 			this.clearSelection();
 			this.selectedInkId = null;
 			this.editingNoteId = null;
 			this.redrawAllInk();
 		}
+		this.selectionActions?.refreshIndicator();
 	}
 
-	private setPenWidth(index: number): void {
-		this.penWidthIndex = index;
-	}
+	private penWidthPx(): number { return this.penWidth; }
 
-	private penBtn: HTMLButtonElement | null = null;
-	private rectangleBtn: HTMLButtonElement | null = null;
-
-	private penWidthPx(): number {
-		return [2, 4, 7][this.penWidthIndex] ?? 4;
-	}
-
-	private pageFromEvent(e: PointerEvent): RenderedPage | null {
-		const el = (e.target as HTMLElement).closest?.(".pr-page");
-		if (!(el instanceof HTMLElement)) return null;
-		const n = Number(el.dataset.pageNumber);
-		return this.pages.find((p) => p.pageNumber === n) ?? null;
-	}
-
-	private onPenPointerDown(e: PointerEvent): void {
-		if (e.button !== 0 || this.liveStroke || this.rectangleEdit) return;
-		const editTarget = (e.target as Element).closest?.<SVGElement>("[data-ink-handle]");
-		if (!this.drawingTool && editTarget?.dataset.annotationId && editTarget.dataset.inkHandle) {
-			const ann = this.data.annotations.find((a) => a.id === editTarget.dataset.annotationId);
-			const page = ann && this.pages.find((p) => p.pageNumber === ann.page);
-			if (ann?.ink?.shape === "rectangle" && page) {
-				const point = this.pointOnPage(e, page);
-				this.rectangleEdit = {
-					id: ann.id, page: ann.page, pointerId: e.pointerId,
-					handle: editTarget.dataset.inkHandle as RectangleHandle,
-					startX: point.x, startY: point.y,
-					bounds: inkBoundingRect(ann.ink.points), before: cloneAnnotation(ann),
-				};
-				e.preventDefault();
-				e.stopPropagation();
-				this.scrollEl.setPointerCapture(e.pointerId);
-				return;
-			}
+	private getDrawingController(): DrawingController {
+		if (!this.drawingController) {
+			const view = this;
+			this.drawingController = new DrawingController({
+				get tool() { return view.drawingTool; },
+				get liveStroke() { return view.liveStroke; }, set liveStroke(value) { view.liveStroke = value; },
+				get liveStrokePage() { return view.liveStrokePage; }, set liveStrokePage(value) { view.liveStrokePage = value; },
+				get rectangleEdit() { return view.rectangleEdit; }, set rectangleEdit(value) { view.rectangleEdit = value; },
+			}, {
+				pages: () => this.pages, scale: () => this.scale, scrollElement: () => this.scrollEl,
+				annotations: () => this.data.annotations, setAnnotations: annotations => { this.data.annotations = annotations; },
+				color: () => ({ key: this.popupColor, css: (this.plugin.settings.highlightColors as Record<string, string>)[this.popupColor] ?? this.popupColor }),
+				width: () => this.penWidthPx(), documentIdentity: () => this.closed || !this.file ? null : this.documentToken,
+				persistAndRefresh: pages => this.persistAndRefresh(pages), recordHistory: op => this.history.push(op),
+				setTool: tool => this.setDrawingTool(tool), redrawInk: page => this.redrawInk(page), redrawAllInk: () => this.redrawAllInk(),
+				selectRectangle: (ann, x, y) => {
+					this.selectedInkId = ann.id; this.editingNoteId = ann.id;
+					this.redrawAllInk(); this.popup.showEdit(ann, x, y);
+				},
+			});
 		}
-		if (!this.drawingTool) return;
-		const page = this.pageFromEvent(e);
-		if (!page) return;
-		e.preventDefault();
-		e.stopPropagation();
-		const { x, y } = this.pointOnPage(e, page);
-		this.liveStrokePage = page.pageNumber;
-		const begin = this.drawingTool === "rectangle" ? beginInkRectangle : beginInkStroke;
-		this.liveStroke = begin(
-			page.inkLayer,
-			(this.plugin.settings.highlightColors as Record<string, string>)[this.popupColor] ??
-				this.popupColor,
-			this.penWidthPx(),
-			this.scale,
-			x,
-			y
-		);
-		this.scrollEl.setPointerCapture(e.pointerId);
+		return this.drawingController;
 	}
 
-	private onPenPointerMove(e: PointerEvent): void {
-		if (this.rectangleEdit) {
-			const edit = this.rectangleEdit;
-			const ann = this.data.annotations.find((a) => a.id === edit.id);
-			const page = this.pages.find((p) => p.pageNumber === edit.page);
-			if (!ann?.ink || !page) return;
-			e.preventDefault();
-			const point = this.pointOnPage(e, page);
-			const bounds = transformRectangle(
-				edit.bounds, edit.handle, point.x - edit.startX, point.y - edit.startY,
-				page.widthAtScale1, page.heightAtScale1, 8 / this.scale
-			);
-			ann.ink.points = rectanglePoints(bounds.x, bounds.y, bounds.width, bounds.height);
-			ann.rects = [bounds];
-			this.redrawInk(page);
-			return;
-		}
-		if (!this.liveStroke) return;
-		const page = this.pages.find((p) => p.pageNumber === this.liveStrokePage);
-		if (!page) return;
-		e.preventDefault();
-		const { x, y } = this.pointOnPage(e, page);
-		this.liveStroke.addPoint(x, y);
-	}
-
-	private onPenPointerEnd(e: PointerEvent, commit: boolean): void {
-		if (this.rectangleEdit) {
-			void this.finishRectangleEdit(e.pointerId, commit);
-			return;
-		}
-		const stroke = this.liveStroke;
-		if (!stroke) return;
-		this.liveStroke = null;
-		if (this.scrollEl.hasPointerCapture(e.pointerId)) {
-			this.scrollEl.releasePointerCapture(e.pointerId);
-		}
-		if (!commit) {
-			stroke.discard();
-			return;
-		}
-		const ink = stroke.finish();
-		if (!ink || !this.file) return;
-		const page = this.liveStrokePage;
-		const ann: Annotation = {
-			id: crypto.randomUUID(),
-			type: "ink",
-			page,
-			rects: [inkBoundingRect(ink.points)],
-			text: "",
-			color: this.popupColor,
-			ink,
-			createdAt: new Date().toISOString(),
-			textOffset: -1,
-			contextBefore: "",
-			contextAfter: "",
-		};
-		this.data.annotations.push(ann);
-		void this.persistAndRefresh([page]).then((ok) => {
-			if (ok) {
-				this.history.push({ kind: "add", ann });
-				if (ink.shape === "rectangle") {
-					this.setDrawingTool(null);
-					this.selectedInkId = ann.id;
-					this.editingNoteId = ann.id;
-					this.redrawAllInk();
-					this.popup.showEdit(ann, e.clientX, e.clientY);
-				}
-			}
-			else this.data.annotations = this.data.annotations.filter((a) => a.id !== ann.id);
-		});
-	}
-
-	private pointOnPage(e: PointerEvent, page: RenderedPage): { x: number; y: number } {
-		const rect = page.wrapper.getBoundingClientRect();
-		return {
-			x: Math.min(Math.max((e.clientX - rect.left) / this.scale, 0), page.widthAtScale1),
-			y: Math.min(Math.max((e.clientY - rect.top) / this.scale, 0), page.heightAtScale1),
-		};
-	}
-
-	private cancelRectangleEdit(): void {
-		const edit = this.rectangleEdit;
-		if (!edit) return;
-		const ann = this.data.annotations.find((a) => a.id === edit.id);
-		if (ann) Object.assign(ann, edit.before);
-		if (this.scrollEl?.hasPointerCapture(edit.pointerId)) this.scrollEl.releasePointerCapture(edit.pointerId);
-		this.rectangleEdit = null;
-		this.redrawAllInk();
-	}
-
-	private async finishRectangleEdit(pointerId: number, commit: boolean): Promise<void> {
-		const edit = this.rectangleEdit;
-		if (!edit) return;
-		this.rectangleEdit = null;
-		if (this.scrollEl.hasPointerCapture(pointerId)) this.scrollEl.releasePointerCapture(pointerId);
-		const ann = this.data.annotations.find((a) => a.id === edit.id);
-		if (!ann) return;
-		if (!commit) {
-			Object.assign(ann, edit.before);
-			this.redrawAllInk();
-			return;
-		}
-		if (JSON.stringify(ann.ink?.points) === JSON.stringify(edit.before.ink?.points)) return;
-		if (!(await this.persistAndRefresh([edit.page]))) {
-			Object.assign(ann, edit.before);
-			this.redrawAllInk();
-			return;
-		}
-		this.history.push({ kind: "update", before: edit.before, after: cloneAnnotation(ann) });
-	}
+	private pageFromEvent(e: PointerEvent): RenderedPage | null { return this.getDrawingController().pageFromEvent(e); }
+	private pointOnPage(e: PointerEvent, page: RenderedPage): { x: number; y: number } { return this.getDrawingController().pointOnPage(e, page); }
+	private onPenPointerDown(e: PointerEvent): void { this.getDrawingController().pointerDown(e); }
+	private onPenPointerMove(e: PointerEvent): void { this.getDrawingController().pointerMove(e); }
+	private onPenPointerEnd(e: PointerEvent, commit: boolean): void { this.getDrawingController().pointerEnd(e, commit); }
+	private cancelRectangleEdit(): void { if (this.rectangleEdit) this.getDrawingController().cancelRectangleEdit(); }
+	private finishRectangleEdit(pointerId: number, commit: boolean): Promise<void> { return this.getDrawingController().finishRectangleEdit(pointerId, commit); }
 
 	private redrawInk(page: RenderedPage): void {
 		if (!this.mountedPages.has(page.pageNumber)) return;
@@ -1437,51 +1500,49 @@ export class PaperReaderView extends ItemView {
 	}
 
 	private onInkClick(ann: Annotation, x: number, y: number): void {
-		this.selectedInkId = ann.id;
+		this.closePenMenu(); this.popup.hide();
+		this.selectedInkId = this.activeAnnotationId = this.editingNoteId = ann.id;
+		this.redrawAllHighlights();
+		this.selectionActions?.refreshIndicator();
 		this.redrawAllInk();
-		if (ann.ink?.shape === "rectangle") {
-			this.editingNoteId = ann.id;
-			this.hlMenu.hide();
-			this.popup.showEdit(ann, x, y);
-		} else {
-			this.popup.hide();
-			this.hlMenu.show(x, y, ann.color);
-		}
+		this.hlMenu.hide();
+		this.popup.showEdit(ann, x, y);
 	}
 
 	// ---- undo / redo ----
 
 	private async applyHistoryOp(op: HistoryOp, dir: HistoryDirection): Promise<boolean> {
 		if (!this.file) return false;
-		const anns = this.data.annotations;
-		if (op.kind === "add") {
-			if (dir === "undo") {
-				this.data.annotations = anns.filter((a) => a.id !== op.ann.id);
-			} else {
-				this.data.annotations = [...anns, cloneAnnotation(op.ann)];
+		const apply = (change: HistoryOp): void => {
+			if (change.kind === "batch") {
+				for (const child of dir === "undo" ? [...change.ops].reverse() : change.ops) apply(child);
+				return;
 			}
-		} else if (op.kind === "remove") {
-			if (dir === "undo") {
-				const list = [...anns];
-				op.anns.forEach((ann, i) => {
-					list.splice(Math.min(op.indexes[i], list.length), 0, cloneAnnotation(ann));
-				});
-				this.data.annotations = list;
+			const anns = this.data.annotations;
+			if (change.kind === "add") {
+				this.data.annotations = dir === "undo"
+					? anns.filter(a => a.id !== change.ann.id)
+					: [...anns, cloneAnnotation(change.ann)];
+			} else if (change.kind === "remove") {
+				if (dir === "undo") {
+					const list = [...anns];
+					change.anns.forEach((ann, i) => list.splice(Math.min(change.indexes[i], list.length), 0, cloneAnnotation(ann)));
+					this.data.annotations = list;
+				} else {
+					const ids = new Set(change.anns.map(a => a.id));
+					this.data.annotations = anns.filter(a => !ids.has(a.id));
+				}
 			} else {
-				const ids = new Set(op.anns.map((a) => a.id));
-				this.data.annotations = anns.filter((a) => !ids.has(a.id));
+				const target = dir === "undo" ? change.before : change.after;
+				this.data.annotations = anns.map(a => a.id === target.id ? cloneAnnotation(target) : a);
 			}
-		} else {
-			const target = dir === "undo" ? op.before : op.after;
-			this.data.annotations = anns.map((a) =>
-				a.id === target.id ? cloneAnnotation(target) : a
-			);
-		}
+		};
+		apply(op);
 		const ok = await this.persistAndRefresh();
 		if (!ok) {
 			// persistence failed: applyHistoryOp's caller keeps stack pointers,
 			// but data must be restored to match
-			new Notice("撤销/重做保存失败，操作已回滚");
+			new Notice(t("撤销/重做保存失败，操作已回滚"));
 			const revertDir: HistoryDirection = dir === "undo" ? "redo" : "undo";
 			// re-apply in the opposite direction without saving again is unsafe;
 			// simplest consistent fallback: reload handled annotations from disk
@@ -1516,6 +1577,7 @@ export class PaperReaderView extends ItemView {
 				this.redrawAllInk();
 			}
 			this.refreshAnnotationList();
+			this.selectionActions?.refreshIndicator();
 		}
 		return ok;
 	}
@@ -1529,7 +1591,9 @@ export class PaperReaderView extends ItemView {
 	// ---- annotation list interactions + notes export ----
 
 	private async jumpToAnnotation(ann: Annotation): Promise<void> {
+		this.rememberNavigation();
 		await this.scrollToPage(ann.page);
+		this.scrollToRect(ann.page, ann.rects[0]);
 		this.flashAnnotation(ann.id);
 	}
 
@@ -1558,30 +1622,32 @@ export class PaperReaderView extends ItemView {
 
 	private async exportAllAnnotations(): Promise<void> {
 		if (!this.file || this.data.annotations.length === 0) {
-			new Notice("暂无可导出的标注");
+			new Notice(t("暂无可导出的标注"));
 			return;
 		}
 		await appendManyToNotes(this.app, this.file.path, this.plugin.settings.notesSuffix,
-			this.data.annotations.map(ann => this.notesEntryFor(ann)));
+			this.data.annotations.filter((ann, i, all) => !ann.groupId || all.findIndex(a => a.groupId === ann.groupId) === i).map(ann => this.notesEntryFor(ann)));
 	}
 
 	private notesEntryFor(ann: Annotation): NotesEntry {
-		const base = { page: ann.page, annId: ann.id };
+		const group = this.annotationGroup(ann).sort((a, b) => a.page - b.page);
+		const base = { page: group[0].page, annId: group[0].id };
+		const quote = group.map(a => a.text).join("\n");
 		switch (ann.type) {
 			case "note":
-				return { ...base, title: "批注", quote: ann.text, content: ann.note ?? "" };
+				return { ...base, title: t("批注"), quote, content: ann.note ?? "" };
 			case "translation":
-				return { ...base, title: "翻译", quote: ann.text, content: ann.aiContent ?? "" };
+				return { ...base, title: t("翻译"), quote, content: ann.aiContent ?? "" };
 			case "ink": {
 				const svg = inkPreviewSvg(ann, 120)?.outerHTML ?? "";
 				const bytes = new TextEncoder().encode(svg);
 				let binary = "";
 				for (const byte of bytes) binary += String.fromCharCode(byte);
 				const img = `![画笔 p.${ann.page}](data:image/svg+xml;base64,${btoa(binary)})`;
-				return { ...base, title: "画笔", quote: "", content: img };
+				return { ...base, title: t("画笔"), quote: "", content: img };
 			}
 			default:
-				return { ...base, title: "高亮", quote: ann.text, content: ann.note ?? "" };
+				return { ...base, title: t("高亮"), quote, content: ann.note ?? "" };
 		}
 	}
 
@@ -1589,7 +1655,7 @@ export class PaperReaderView extends ItemView {
 
 	/** Only selections anchored inside this reader can drive its preview or actions. */
 	private activeTextSelection(): Selection | null {
-		const sel = window.getSelection();
+		const sel = this.contentEl.ownerDocument.getSelection();
 		return sel && !sel.isCollapsed && sel.toString().trim() && sel.anchorNode && this.pagesEl.contains(sel.anchorNode)
 			? sel : null;
 	}
@@ -1626,6 +1692,7 @@ export class PaperReaderView extends ItemView {
 		const payload = sel ? selectionToPayload(sel, this.scale, (p) => this.renderer.getPageText(p)) : null;
 		this.currentPayload = payload;
 		this.paintSelectionPreview(sel);
+		if (this.editingRangeId) this.drawRangeHandles();
 		this.selectionActions?.setEnabled(!!payload);
 	}
 
@@ -1633,7 +1700,12 @@ export class PaperReaderView extends ItemView {
 		// let the browser finalise the selection first
 		window.setTimeout(() => {
 			this.refreshSelectionState();
-			if (this.plugin.settings.showFloatingToolbar && this.currentPayload) {
+			if (this.textTool && this.currentPayload && !this.editingRangeId) {
+				this.popupStyle = this.textTool;
+				void this.commitHighlight(this.popupColor);
+				return;
+			}
+			if (!this.editingRangeId && this.plugin.settings.showFloatingToolbar && this.currentPayload) {
 				this.hlMenu.hide();
 				this.editingNoteId = null;
 				this.popup.show(this.currentPayload);
@@ -1641,17 +1713,28 @@ export class PaperReaderView extends ItemView {
 		}, 0);
 	}
 
-	private openNotePopup(): void {
-		if (!this.currentPayload) return;
-		this.editingNoteId = null;
+	private async openNotePopup(): Promise<void> {
+		const payload = this.popup.payloadSnapshot ?? this.currentPayload;
+		if (!payload) return;
+		const ann = await this.commitHighlight(this.popupColor, payload);
+		if (!ann) return;
+		this.editingNoteId = ann.id;
 		this.hlMenu.hide();
-		this.popup.show(this.currentPayload);
+		this.popup.showEdit(ann, payload.anchorRect.left, payload.anchorRect.bottom);
 		this.popup.focusNote();
+	}
+
+	private setTextTool(style: AnnotationStyle | null): void {
+		this.setDrawingTool(null);
+		this.textTool = style;
+		if (style) this.popupStyle = style;
+		this.popup.hide();
+		this.selectionActions?.refreshIndicator();
 	}
 
 	private withPayload(fn: (payload: SelectionPayload) => void): void {
 		if (!this.currentPayload) {
-			new Notice("请先在 PDF 中选择文字");
+			new Notice(t("请先在 PDF 中选择文字"));
 			return;
 		}
 		fn(this.currentPayload);
@@ -1660,42 +1743,45 @@ export class PaperReaderView extends ItemView {
 	private async commitHighlight(
 		color: string,
 		payload: SelectionPayload | null = this.currentPayload
-	): Promise<void> {
+	): Promise<Annotation | undefined> {
 		if (!payload || !this.file) {
-			new Notice("请先在 PDF 中选择文字");
+			new Notice(t("请先在 PDF 中选择文字"));
 			return;
 		}
-		this.popupColor = color;
-		this.selectionActions?.refreshIndicator();
-		const annotation = annotationFromPayload(payload, {
-			type: "highlight",
-			color,
-			style: this.popupStyle,
-		});
-		this.data.annotations.push(annotation);
-		if (!(await this.persistAndRefresh([payload.page]))) {
-			this.data.annotations = this.data.annotations.filter(
-				(a) => a.id !== annotation.id
-			);
-			return;
+		if (this.savingHighlight) return;
+		this.savingHighlight = true;
+		try {
+			this.popupColor = color;
+			this.selectionActions?.refreshIndicator();
+			const annotations = this.annotationsForPayload(payload, { type: "highlight", color, style: this.popupStyle });
+			const backup = this.data.annotations;
+			this.data.annotations = [...backup, ...annotations];
+			if (!(await this.persistAndRefresh(annotations.map(a => a.page)))) {
+				this.data.annotations = backup;
+				return;
+			}
+			this.recordAdded(annotations);
+			this.clearSelection();
+			return annotations[0];
+		} finally {
+			this.savingHighlight = false;
 		}
-		this.history.push({ kind: "add", ann: annotation });
-		this.clearSelection();
 	}
 
 	// ---- selection popup actions ----
 
 	/** marker menu color picked: annotate selection, or just switch the default */
 	private async applyHeaderColor(color: string): Promise<void> {
+		const ink = this.data.annotations.find(a => a.id === this.selectedInkId && a.ink);
+		if (ink) { await this.updateGroup(ink, { color }); return; }
 		this.popupColor = color;
 		this.selectionActions?.refreshIndicator();
 		if (this.currentPayload) await this.commitHighlight(color);
 	}
 
-	/** marker menu style picked: annotate selection, or just switch the default */
-	private async applyHeaderStyle(style: AnnotationStyle): Promise<void> {
-		this.popupStyle = style;
-		if (this.currentPayload) await this.commitHighlight(this.popupColor);
+	/** All toolbar style buttons activate the tool for subsequent selections. */
+	private applyHeaderStyle(style: AnnotationStyle): void {
+		this.setTextTool(style);
 	}
 
 	/** color dot clicked in the popup: annotate selection, or recolor edit target */
@@ -1703,13 +1789,7 @@ export class PaperReaderView extends ItemView {
 		if (this.editingNoteId) {
 			const ann = this.data.annotations.find((a) => a.id === this.editingNoteId);
 			if (ann && this.file) {
-				const before = cloneAnnotation(ann);
-				ann.color = color;
-				if (!(await this.persistAndRefresh())) {
-					Object.assign(ann, before);
-					return;
-				}
-				this.history.push({ kind: "update", before, after: cloneAnnotation(ann) });
+				if (!(await this.updateGroup(ann, { color }))) return;
 			}
 			this.editingNoteId = null;
 			this.popup.hide();
@@ -1725,27 +1805,31 @@ export class PaperReaderView extends ItemView {
 		if (this.editingNoteId) {
 			const ann = this.data.annotations.find((a) => a.id === this.editingNoteId);
 			if (ann && this.file) {
-				const before = cloneAnnotation(ann);
-				ann.style = style;
-				if (!(await this.persistAndRefresh())) {
-					Object.assign(ann, before);
-					return;
-				}
-				this.history.push({ kind: "update", before, after: cloneAnnotation(ann) });
+				await this.updateGroup(ann, { style });
 			}
 		}
 	}
 
-	private async setPopupInkWidth(width: number): Promise<void> {
-		const ann = this.data.annotations.find((a) => a.id === this.editingNoteId);
-		if (!ann?.ink || !this.file || ann.ink.width === width) return;
-		const before = cloneAnnotation(ann);
-		ann.ink.width = width;
-		if (!(await this.persistAndRefresh([ann.page]))) {
-			Object.assign(ann, before);
-			return;
+	private async setPopupInkWidth(width: number, commit = true, id = this.editingNoteId): Promise<void> {
+		const ann = this.data.annotations.find(a => a.id === id);
+		if (!ann?.ink || !this.file || this.closed || !Number.isFinite(width)) return;
+		width = Math.max(MIN_INK_WIDTH, Math.min(MAX_INK_WIDTH, width));
+		if (!this.inkWidthBefore) {
+			if (ann.ink.width === width) return;
+			this.inkWidthBefore = { annotation: cloneAnnotation(ann), token: this.documentToken };
 		}
-		this.history.push({ kind: "update", before, after: cloneAnnotation(ann) });
+		const edit = this.inkWidthBefore;
+		if (edit.annotation.id !== ann.id || edit.token !== this.documentToken) { this.inkWidthBefore = null; return; }
+		ann.ink.width = width;
+		this.redrawAllInk();
+		if (!commit) return;
+		this.inkWidthBefore = null;
+		if (edit.annotation.ink?.width === width) return;
+		const after = cloneAnnotation(ann);
+		if (!(await this.persistAndRefresh([ann.page]))) {
+			Object.assign(ann, edit.annotation); this.redrawAllInk(); return;
+		}
+		if (edit.token === this.documentToken && !this.closed) this.history.push({ kind: "update", before: edit.annotation, after });
 	}
 
 	/** note submitted in the popup: create a note annotation, or update the edit target */
@@ -1753,13 +1837,16 @@ export class PaperReaderView extends ItemView {
 		if (this.editingNoteId) {
 			const ann = this.data.annotations.find((a) => a.id === this.editingNoteId);
 			if (ann && this.file) {
-				const before = cloneAnnotation(ann);
-				ann.note = text;
-				// on save failure keep the edited draft in memory (retry-safe),
-				// just without the success notice or history entry
+				const group = this.annotationGroup(ann);
+				const before = group.map(a => cloneAnnotation(a));
+				for (const item of group) item.note = text;
+				// Keep the user's draft after a failed save; only saved edits enter history.
 				if (!(await this.persistAndRefresh())) return false;
-				this.history.push({ kind: "update", before, after: cloneAnnotation(ann) });
-				new Notice("批注已更新");
+				if (this.pendingNoteIds?.includes(ann.id)) {
+					this.recordAdded(group);
+					this.pendingNoteIds = [];
+				} else this.recordUpdates(before, group);
+				new Notice(t("批注已更新"));
 			}
 			this.editingNoteId = null;
 			this.popup.hide();
@@ -1767,21 +1854,19 @@ export class PaperReaderView extends ItemView {
 		}
 		const payload = this.popup.payloadSnapshot ?? this.currentPayload;
 		if (!payload || !this.file) {
-			new Notice("选区已失效，请重新选择后再添加批注");
+			new Notice(t("选区已失效，请重新选择后再添加批注"));
 			return false;
 		}
-		const annotation = annotationFromPayload(payload, {
-			type: "note",
-			color: this.popupColor,
-			style: "highlight",
-			note: text,
+		const annotations = this.annotationsForPayload(payload, {
+			type: "note", color: this.popupColor, style: this.popupStyle, note: text,
 		});
-		this.data.annotations.push(annotation);
-		// Retain the draft as an edit target so retries do not duplicate it.
-		this.editingNoteId = annotation.id;
-		if (!(await this.persistAndRefresh([payload.page]))) return false;
-		this.history.push({ kind: "add", ann: annotation });
-		new Notice("批注已添加");
+		this.data.annotations.push(...annotations);
+		this.pendingNoteIds = annotations.map(a => a.id);
+		this.editingNoteId = annotations[0].id;
+		if (!(await this.persistAndRefresh(annotations.map(a => a.page)))) return false;
+		this.recordAdded(annotations);
+		this.pendingNoteIds = [];
+		new Notice(t("批注已添加"));
 		this.clearSelection();
 		return true;
 	}
@@ -1789,13 +1874,14 @@ export class PaperReaderView extends ItemView {
 	/** streaming translation for the popup; throws LlmError on config/network issues */
 	private async translateForPopup(
 		payload: SelectionPayload,
-		onChunk: (full: string) => void
+		onChunk: (full: string) => void,
+		signal?: AbortSignal
 	): Promise<string> {
 		const s = this.plugin.settings;
 		if (!s.llmBaseUrl.trim() || !s.llmApiKey.trim() || !s.llmModel.trim()) {
 			throw new LlmError(
 				"config",
-				"请先在 设置 → Paper Reader 中配置 LLM（Base URL / API Key / 模型名）"
+				t("请先在 设置 → Paper Reader 中配置 LLM（Base URL / API Key / 模型名）")
 			);
 		}
 		const file = this.file;
@@ -1803,7 +1889,7 @@ export class PaperReaderView extends ItemView {
 		const document = this.documentToken;
 		const messages = buildTranslateMessages(payload.text, s.translateTargetLang);
 		let out = "";
-		for await (const chunk of this.llm.streamChat(messages)) {
+		for await (const chunk of this.llm.streamChat(messages, signal)) {
 			out += chunk;
 			onChunk(out);
 		}
@@ -1811,19 +1897,14 @@ export class PaperReaderView extends ItemView {
 		// record as a translation annotation, mirroring the answer panel flow;
 		// use the popup's payload directly (selection may be gone by now)
 		if (this.file) {
-			this.data.annotations.push(
-				annotationFromPayload(payload, {
-					type: "translation",
-					color: "",
-					aiContent: out,
-				})
-			);
-			await this.store.save(this.file.path, this.data);
+			const annotations = this.annotationsForPayload(payload, { type: "translation", color: "", aiContent: out });
+			this.data.annotations.push(...annotations);
+			if (await this.persistAndRefresh()) this.recordAdded(annotations);
 		}
 		// selection may have changed while the request was in flight — the
 		// result stays bound to the captured snapshot, never the new selection
 		if (this.currentPayload && !sameSelection(this.currentPayload, payload)) {
-			new Notice("选区已变化，结果仍关联原选中文本");
+			new Notice(t("选区已变化，结果仍关联原选中文本"));
 		}
 		return out;
 	}
@@ -1831,11 +1912,11 @@ export class PaperReaderView extends ItemView {
 	private async insertPopupTranslation(translation: string): Promise<void> {
 		const payload = this.popup.payloadSnapshot ?? this.currentPayload;
 		if (!this.file || !payload) {
-			new Notice("选区已失效，请重新选择后再插入");
+			new Notice(t("选区已失效，请重新选择后再插入"));
 			return;
 		}
 		await appendToNotes(this.app, this.file.path, this.plugin.settings.notesSuffix, {
-			title: "翻译",
+			title: t("翻译"),
 			page: payload.page,
 			quote: payload.text,
 			content: translation,
@@ -1846,22 +1927,26 @@ export class PaperReaderView extends ItemView {
 	private async clearHighlightsInSelection(): Promise<void> {
 		const payload = this.currentPayload;
 		if (!payload || !this.file) {
-			new Notice("请先在 PDF 中选择文字");
+			new Notice(t("请先在 PDF 中选择文字"));
 			return;
 		}
 		const removedAnns: Annotation[] = [];
 		const removedIdx: number[] = [];
 		this.data.annotations.forEach((a, i) => {
-			if (a.type !== "highlight" || a.page !== payload.page) return;
-			if (a.rects.some((r1) => payload.rects.some((r2) => rectsOverlap(r1, r2)))) {
+			if (a.type !== "highlight") return;
+			if ((payload.segments ?? [payload]).some(segment => segment.page === a.page && a.rects.some(r1 => segment.rects.some(r2 => rectsOverlap(r1, r2))))) {
 				removedAnns.push(a);
 				removedIdx.push(i);
 			}
 		});
 		if (removedAnns.length === 0) {
-			new Notice("选区内没有高亮");
+			new Notice(t("选区内没有高亮"));
 			return;
 		}
+		const groups = new Set(removedAnns.map(a => a.groupId).filter(Boolean));
+		this.data.annotations.forEach((a, i) => {
+			if (a.groupId && groups.has(a.groupId) && !removedAnns.includes(a)) { removedAnns.push(a); removedIdx.push(i); }
+		});
 		const removedIds = new Set(removedAnns.map((a) => a.id));
 		const backup = this.data.annotations;
 		this.data.annotations = backup.filter((a) => !removedIds.has(a.id));
@@ -1869,12 +1954,14 @@ export class PaperReaderView extends ItemView {
 			this.data.annotations = backup;
 			return;
 		}
-		this.history.push({ kind: "remove", anns: removedAnns, indexes: removedIdx });
-		new Notice(`已删除 ${removedAnns.length} 条高亮`);
+		const ordered = removedAnns.map((ann, i) => ({ ann, index: removedIdx[i] })).sort((a, b) => a.index - b.index);
+		this.history.push({ kind: "remove", anns: ordered.map(x => cloneAnnotation(x.ann)), indexes: ordered.map(x => x.index) });
+		new Notice(t("已删除 {count} 条高亮", { count: removedAnns.length }));
 		this.clearSelection();
 	}
 
 	private clearSelection(): void {
+		this.cancelRangeEdit();
 		this.currentPayload = null;
 		for (const page of this.pages) {
 			if (page.wrapper.classList.contains("pr-selection-preview")) {
@@ -1884,21 +1971,21 @@ export class PaperReaderView extends ItemView {
 		this.editingNoteId = null;
 		this.selectionActions?.setEnabled(false);
 		this.popup.hide();
-		window.getSelection()?.removeAllRanges();
+		this.contentEl.ownerDocument.getSelection()?.removeAllRanges();
 	}
 
 	private async copySelection(): Promise<void> {
-		const payload = this.currentPayload;
+		const payload = this.popup.payloadSnapshot ?? this.currentPayload;
 		if (!payload) {
-			new Notice("请先在 PDF 中选择文字");
+			new Notice(t("请先在 PDF 中选择文字"));
 			return;
 		}
 		try {
 			await navigator.clipboard.writeText(payload.text);
-			new Notice("已复制");
+			new Notice(t("已复制"));
 		} catch (e) {
 			console.error("[paper-reader] clipboard failed", e);
-			new Notice("复制失败");
+			new Notice(t("复制失败"));
 		}
 	}
 
@@ -1907,13 +1994,19 @@ export class PaperReaderView extends ItemView {
 	/** Assemble the context text for AI requests per the configured level. */
 	private async openAiPanel(mode: PanelMode, payload: SelectionPayload): Promise<void> {
 		const request = ++this.aiPanelToken, document = this.documentToken;
+		this.panel.prepareContext(mode, payload);
 		try {
 			const context = await this.contextTextFor(payload);
-			if (this.closed || request !== this.aiPanelToken || document !== this.documentToken) return;
+			if (this.closed || request !== this.aiPanelToken || document !== this.documentToken || !this.panel.isOpen) return;
 			if (mode === "translate") this.panel.openTranslate(payload, context);
 			else if (mode === "explain") this.panel.openExplain(payload, context);
 			else this.panel.openAsk(payload, context);
-		} catch { if (!this.closed && document === this.documentToken) new Notice("无法读取 AI 上下文，请重试"); }
+		} catch {
+			if (!this.closed && document === this.documentToken && request === this.aiPanelToken && this.panel.isOpen) {
+				this.panel.showContextError();
+				new Notice(t("无法读取 AI 上下文，请重试"));
+			}
+		}
 	}
 
 	private async contextTextFor(payload: SelectionPayload): Promise<string> {
@@ -1921,21 +2014,10 @@ export class PaperReaderView extends ItemView {
 		const level = this.plugin.settings.aiContextLevel;
 		if (level === "selection") return payload.text;
 		const pageText = await this.renderer.getPageTextEnsured(payload.page) || payload.text;
-		if (level === "page") return pageText;
-		// full text, expanded around the current page within a char budget
-		const n = this.renderer.numPages;
-		let text = `[page ${payload.page}]\n${pageText}\n`;
-		for (let d = 1; d < n && text.length < FULL_TEXT_LIMIT; d++) {
-			if (token !== this.documentToken || this.closed) break;
-			for (const p of [payload.page - d, payload.page + d]) {
-				if (p < 1 || p > n) continue;
-				const t = await this.renderer.getPageTextEnsured(p);
-				if (!t) continue;
-				text += `[page ${p}]\n${t}\n`;
-				if (text.length >= FULL_TEXT_LIMIT) break;
-			}
-		}
-		return text.slice(0, FULL_TEXT_LIMIT);
+		if (level === "page") return `[page ${payload.page}]\n${pageText}`;
+		return buildPageContext(payload.page, this.renderer.numPages,
+			p => this.renderer.getPageTextEnsured(p),
+			() => token === this.documentToken && !this.closed);
 	}
 
 	/** Record completed translations as annotations (type: translation). */
@@ -1945,36 +2027,130 @@ export class PaperReaderView extends ItemView {
 		answer: string
 	): Promise<void> {
 		if (mode !== "translate" || !this.file || this.closed) return;
-		this.data.annotations.push(
-			annotationFromPayload(payload, {
-				type: "translation",
-				color: "",
-				aiContent: answer,
-			})
-		);
-		if (!(await this.store.save(this.file.path, this.data))) return;
+		const annotations = this.annotationsForPayload(payload, { type: "translation", color: "", aiContent: answer });
+		this.data.annotations.push(...annotations);
+		if (await this.persistAndRefresh()) this.recordAdded(annotations);
+	}
+
+
+	private cancelRangeEdit(): void {
+		if (this.rangeDrag && this.scrollEl?.hasPointerCapture(this.rangeDrag.pointerId)) this.scrollEl.releasePointerCapture(this.rangeDrag.pointerId);
+		this.rangeDrag = null;
+		this.editingRangeId = null;
+		this.pagesEl?.querySelectorAll(".pr-range-handle").forEach(el => el.remove());
+	}
+
+	private async beginRangeEdit(): Promise<void> {
+		const ann = this.data.annotations.find(a => a.id === this.activeAnnotationId);
+		if (!ann || ann.type !== "highlight") return;
+		this.clearSelection();
+		this.editingRangeId = ann.groupId ?? ann.id;
+		const group = this.annotationGroup(ann).sort((a, b) => a.page - b.page);
+		await this.refreshPageWindow();
+		const first = group[0], last = group[group.length - 1];
+		const firstLayer = this.pages.find(p => p.pageNumber === first.page)?.wrapper.querySelector(".textLayer");
+		const lastLayer = this.pages.find(p => p.pageNumber === last.page)?.wrapper.querySelector(".textLayer");
+		const start = firstLayer && this.annotationCaret(firstLayer, first, false);
+		const end = lastLayer && this.annotationCaret(lastLayer, last, true);
+		if (!start || !end) { this.cancelRangeEdit(); new Notice(t("无法定位标注文字，请重新选择后标注")); return; }
+		this.contentEl.ownerDocument.getSelection()?.setBaseAndExtent(start.startContainer, start.startOffset, end.startContainer, end.startOffset);
+		this.hlMenu.hide(); this.popup.hide();
+		this.refreshSelectionState();
+	}
+
+	private annotationCaret(layer: Element, ann: Annotation, end: boolean): Range | null {
+		const text = this.renderer.getPageText(ann.page) ?? "";
+		if (ann.textOffset >= 0 && text.slice(ann.textOffset, ann.textOffset + ann.text.length) === ann.text) {
+			const caret = rangeFromPageTextOffset(layer, ann.textOffset + (end ? ann.text.length : 0), end);
+			const caretBox = caret?.getClientRects()[0], target = end ? ann.rects[ann.rects.length - 1] : ann.rects[0];
+			const bounds = layer.parentElement!.getBoundingClientRect();
+			if (caret && caretBox && target && Math.abs(caretBox.left - bounds.left - (target.x + (end ? target.width : 0)) * this.scale) < 3 * this.scale) return caret;
+		}
+		const rect = end ? ann.rects[ann.rects.length - 1] : ann.rects[0];
+		if (!rect) return null;
+		const bounds = layer.parentElement!.getBoundingClientRect();
+		return this.caretAt(bounds.left + (rect.x + (end ? rect.width : 0)) * this.scale, bounds.top + (rect.y + rect.height / 2) * this.scale);
+	}
+
+	private caretAt(x: number, y: number): Range | null {
+		const doc = this.contentEl.ownerDocument as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null };
+		const caret = doc.caretRangeFromPoint?.(x, y);
+		return caret && this.pagesEl.contains(caret.startContainer) ? caret : null;
+	}
+
+	private drawRangeHandles(): void {
+		this.pagesEl.querySelectorAll(".pr-range-handle").forEach(el => el.remove());
+		const sel = this.activeTextSelection();
+		if (!sel) return;
+		const range = sel.getRangeAt(0);
+		for (const end of [false, true]) {
+			const caret = range.cloneRange(); caret.collapse(!end);
+			const rect = caret.getClientRects()[0];
+			const page = (caret.startContainer.parentElement)?.closest<HTMLElement>(".pr-page");
+			if (!rect || !page) continue;
+			const bounds = page.getBoundingClientRect();
+			const handle = page.createEl("button", { cls: "pr-range-handle", attr: { "aria-label": end ? t("调整高亮结束位置") : t("调整高亮开始位置") } });
+			handle.style.left = `${rect.left - bounds.left}px`;
+			handle.style.top = `${rect.bottom - bounds.top}px`;
+			handle.addEventListener("pointerdown", event => {
+				event.preventDefault(); event.stopPropagation();
+				this.rangeDrag = { node: end ? range.startContainer : range.endContainer,
+					offset: end ? range.startOffset : range.endOffset, pointerId: event.pointerId };
+				this.scrollEl.setPointerCapture(event.pointerId);
+			});
+		}
+	}
+
+	private moveRangeEndpoint(event: PointerEvent): void {
+		const drag = this.rangeDrag, caret = this.caretAt(event.clientX, event.clientY);
+		if (!drag || !caret || event.pointerId !== drag.pointerId) return;
+		this.contentEl.ownerDocument.getSelection()?.setBaseAndExtent(drag.node, drag.offset, caret.startContainer, caret.startOffset);
+		this.refreshSelectionState();
+	}
+
+	private async saveRangeEdit(): Promise<void> {
+		const ann = this.data.annotations.find(a => a.id === this.editingRangeId || a.groupId === this.editingRangeId);
+		const sel = this.activeTextSelection();
+		const payload = sel && selectionToPayload(sel, this.scale, page => this.renderer.getPageText(page));
+		if (!ann || !payload || !this.file) return;
+		const before = this.annotationGroup(ann), backup = this.data.annotations;
+		const updated = this.annotationsForPayload(payload, { type: ann.type, color: ann.color, style: ann.style, note: ann.note });
+		for (const item of updated) {
+			const previous = before.find(a => a.page === item.page);
+			if (previous) { item.id = previous.id; item.createdAt = previous.createdAt; }
+		}
+		if (updated.length > 1) for (const item of updated) item.groupId = before[0].groupId ?? before[0].id;
+		const ids = new Set(before.map(a => a.id));
+		this.data.annotations = [...backup.filter(a => !ids.has(a.id)), ...updated];
+		if (!(await this.persistAndRefresh())) { this.data.annotations = backup; return; }
+		const ops: HistoryOp[] = [{ kind: "remove", anns: before.map(a => cloneAnnotation(a)), indexes: before.map(a => backup.indexOf(a)) },
+			...updated.map((item): HistoryOp => ({ kind: "add", ann: cloneAnnotation(item) }))];
+		this.history.push({ kind: "batch", ops });
+		this.clearSelection();
 	}
 
 	// ---- existing highlight interactions ----
 
-	private activeAnnotationId: string | null = null;
 
 	private openHighlightMenu(ann: Annotation, x: number, y: number): void {
+		this.closePenMenu(); this.popup.hide();
+		this.selectedInkId = null;
+		this.clearSelection();
 		this.activeAnnotationId = ann.id;
-		this.popup.hide();
-		this.hlMenu.show(x, y, ann.color);
+		this.editingNoteId = ann.id;
+		this.redrawAllInk(); this.redrawAllHighlights();
+		this.hlMenu.hide();
+		const page = this.pages.find(p => p.pageNumber === ann.page);
+		const bounds = page?.wrapper.getBoundingClientRect();
+		const rect = ann.rects.find(r => bounds && x >= bounds.left + r.x * this.scale && x <= bounds.left + (r.x + r.width) * this.scale && y >= bounds.top + r.y * this.scale && y <= bounds.top + (r.y + r.height) * this.scale) ?? ann.rects[0];
+		const anchor = bounds && rect ? new DOMRect(bounds.left + rect.x * this.scale, bounds.top + rect.y * this.scale, rect.width * this.scale, rect.height * this.scale) : undefined;
+		this.popup.showEdit(ann, x, y, anchor);
 	}
 
 	private async recolorHighlight(color: string): Promise<void> {
-		const ann = this.data.annotations.find((a) => a.id === this.activeAnnotationId);
+		const ann = this.data.annotations.find((a) => a.id === (this.selectedInkId ?? this.activeAnnotationId));
 		if (!ann || !this.file) return;
-		const before = cloneAnnotation(ann);
-		ann.color = color;
-		if (!(await this.persistAndRefresh())) {
-			Object.assign(ann, before);
-			return;
-		}
-		this.history.push({ kind: "update", before, after: cloneAnnotation(ann) });
+		if (!(await this.updateGroup(ann, { color }))) return;
 		this.hlMenu.hide();
 	}
 
@@ -1984,12 +2160,14 @@ export class PaperReaderView extends ItemView {
 		if (idx < 0) return;
 		const backup = this.data.annotations;
 		const removed = backup[idx];
-		this.data.annotations = backup.filter((a) => a.id !== removed.id);
+		const group = this.annotationGroup(removed);
+		const ids = new Set(group.map(a => a.id));
+		this.data.annotations = backup.filter(a => !ids.has(a.id));
 		if (!(await this.persistAndRefresh())) {
 			this.data.annotations = backup;
 			return;
 		}
-		this.history.push({ kind: "remove", anns: [removed], indexes: [idx] });
+		this.history.push({ kind: "remove", anns: group.map(a => cloneAnnotation(a)), indexes: group.map(a => backup.indexOf(a)) });
 		if (this.editingNoteId === id) {
 			this.editingNoteId = null;
 			this.popup.hide();

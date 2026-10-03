@@ -7,11 +7,11 @@ Read PDF papers, annotate passages, draw ink, and export linked Markdown notes i
 ## Features
 
 - Text highlights, underlines, wavy underlines, strikethroughs, and editable notes.
-- Mouse ink with seven colors and three widths; select, recolor, or delete strokes.
+- Mouse ink with seven colors and adjustable 0.5–20 pt widths via slider or numeric input; select, recolor, resize, or delete strokes.
 - Session undo/redo, annotation sidebar, thumbnails, and document outline.
 - Full-text search, saved reading position, zoom, continuous, single-page, and two-page layouts.
 - Append-only Markdown export with links back to the PDF page and duplicate-export detection.
-- Optional AI assistance using your own API key.
+- Optional streaming AI translation, concise explanations, and questions using your own API key, with loading feedback and per-answer copying.
 
 ## Install
 
@@ -30,8 +30,8 @@ Select text to annotate it. The pencil toggles ink mode; Escape exits. Use Cmd/C
 - Reading and annotation work offline. This plugin contains no telemetry or advertisements.
 - Annotations are stored in a sibling `*.annotations.json` file; they are **not embedded in the PDF**. Exported notes are saved as sibling `*.notes.md` files. Back up these sidecars with your PDF.
 - Reading positions and settings are stored in the plugin's `data.json`.
-- Remote AI endpoints must use HTTPS; HTTP is allowed only for localhost, 127.0.0.1, and ::1. Before the first request in each reader window (and after changing endpoints), a confirmation explains the destination and data sent. Data goes directly to the configured provider, not a developer-operated relay.
-- AI is optional. It requires an endpoint, model, and API key you supply. The provider may require an account and charge for usage. On an explicit AI action, selected text, configured surrounding context (which may include page text), questions, and conversation history are sent to that endpoint. The connection test also sends a request. Your provider's privacy terms apply.
+- Remote AI endpoints must use HTTPS; HTTP is allowed only for localhost, 127.0.0.1, and ::1. Data goes directly to the configured provider, not a developer-operated relay. AI answers stream via SSE and have a 120-second timeout; closing the popup/panel or switching documents cancels the request. The desktop transport uses Node HTTP(S) and does not inherit Chromium proxy settings.
+- AI is optional. It requires an endpoint, model, and API key you supply. The provider may require an account and charge for usage. On an explicit AI action, selected text, configured surrounding context (full-document context by default, up to 48,000 characters), questions, and conversation history are sent to that endpoint. The connection test also sends a request. Your provider's privacy terms apply.
 - The API key is stored in plaintext in `data.json`, not a secure keychain. Vault synchronization or backups that include this file may copy it. Never publish it or attach it to a bug report.
 - No access to files outside the vault is required for normal use.
 
@@ -39,7 +39,7 @@ Select text to annotate it. The pencil toggles ink mode; Escape exits. Use Cmd/C
 
 - No OCR: image-only scans cannot be searched or selected as text.
 - Ink has no pressure sensitivity, eraser, or shape recognition.
-- Some PDFs with unusual text layers can have search-highlight offsets. Documents requiring supplementary PDF.js font/CMap/image resources may not render fully; report a reproducible, shareable sample.
+- Some PDFs with unusual text layers can have search-highlight offsets. PDF.js fonts, CMaps, and image decoders are bundled for offline use; report a reproducible, shareable sample if rendering fails.
 - Undo history is per view/session and clears on reopen. Cross-vault back-links, simultaneous edits from multiple devices, and moved exported links are not guaranteed.
 - Old `paper-reader://` links are unsupported; new exports use `obsidian://paper-reader`. Existing exported entries are not automatically migrated.
 

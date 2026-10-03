@@ -1,3 +1,7 @@
+import * as inkWidthControl from "../src/toolbar/InkWidthControl";
+import { ReadingPositionManager } from "../src/pdfview/ReadingPositionManager";
+import { t } from "../src/i18n";
+import * as hostInternals from "../src/obsidian-internals";
 // Shared vm loader: execute a TS file with import stubs (no live Obsidian).
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -23,8 +27,9 @@ export function loadTs(path: string, imports: Record<string, unknown> = {}): any
 		compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 	}).outputText;
 	runInNewContext(source, {
+		AbortController,
 		exports,
-		require: (name: string) => imports[name] ?? obsidianStub,
+		require: (name: string) => imports[name] ?? (name.endsWith("/InkWidthControl") ? inkWidthControl : name.endsWith("/ReadingPositionManager") ? { ReadingPositionManager } : name.endsWith("/i18n") ? { t } : name.endsWith("/obsidian-internals") ? hostInternals : obsidianStub),
 		document: { body: elementStub() },
 		window: { innerWidth: 1000, innerHeight: 1000, setTimeout, clearTimeout },
 		DOMRect: class {},

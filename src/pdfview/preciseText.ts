@@ -102,33 +102,114 @@ export function preciseTextContent(content: TextContent, list: PDFOperatorList, 
 	return { content: { ...content, items }, glyphItems };
 }
 
-/** Absolute glyph cells need the original Unicode run for double-click word selection. */
-export function preserveWordSelection(layer: HTMLElement, groups: HTMLElement[][]): void {
-	const groupFor = new WeakMap<HTMLElement, HTMLElement[]>();
-	for (const group of groups) for (const div of group) groupFor.set(div, group);
+export interface PageTextMapping {
+	text: string;
+	items: { start: number; end: number; domStart: number; domEnd: number }[];
+}
+
+/** Shared offsets for extracted page text, rendered spans and search results. */
+export function buildPageText(items: readonly ({ str: string; hasEOL?: boolean } | object)[]): PageTextMapping {
+	let text = "", domOffset = 0;
+	const mapped: PageTextMapping["items"] = [];
+	for (const item of items) {
+		if (!("str" in item) || typeof item.str !== "string") continue;
+		const start = text.length;
+		text += item.str;
+		mapped.push({ start, end: text.length, domStart: domOffset, domEnd: domOffset + item.str.length });
+		domOffset += item.str.length;
+		if ("hasEOL" in item && item.hasEOL) text += "\n";
+	}
+	return { text, items: mapped };
+}
+
+/** Expand words across neighbouring PDF text spans; preserve native handling for RTL/rotation. */
+export function preserveWordSelection(layer: HTMLElement, _groups: HTMLElement[][]): void {
+	const doc = layer.ownerDocument;
 	const segmenter = new Intl.Segmenter(undefined, { granularity: "word" });
-	layer.addEventListener("dblclick", event => {
-		const group = groupFor.get(event.target as HTMLElement);
-		if (!group) return;
-		const offset = group.slice(0, group.indexOf(event.target as HTMLElement))
-			.reduce((sum, div) => sum + (div.textContent?.length ?? 0), 0);
-		const text = group.map(div => div.textContent ?? "").join("");
-		const word = segmenter.segment(text).containing(offset);
-		if (!word) return;
-		const point = (position: number): [Node, number] => {
-			for (const div of group) {
-				const node = div.firstChild!;
-				const length = node.textContent!.length;
-				if (position <= length) return [node, position];
-				position -= length;
-			}
-			const node = group[group.length - 1].firstChild!;
-			return [node, node.textContent!.length];
+	type Point = [Node, number];
+	type Unit = { start: Point; end: Point };
+	let anchor: Unit | null = null, granularity = 2;
+	const caretAt = (x: number, y: number): Range | null => {
+		const api = doc as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null };
+		return api.caretRangeFromPoint?.(x, y) ?? null;
+	};
+	const unitAt = (x: number, y: number, clicks: number): Unit | null => {
+		const caret = caretAt(x, y);
+		const target = caret?.startContainer.parentElement?.closest<HTMLElement>("span");
+		const reader = layer.closest(".pr-pages") ?? layer;
+		const targetLayer = target?.closest<HTMLElement>(".textLayer");
+		if (!caret || !target || !targetLayer || !reader.contains(target) || target.dir === "rtl") return null;
+		const rotation = target.style.getPropertyValue("--rotate");
+		if (rotation && parseFloat(rotation) !== 0) return null;
+		const rect = target.getBoundingClientRect();
+		if (Math.abs(rect.height) < 1) return null;
+		const spans = Array.from(targetLayer.querySelectorAll<HTMLElement>("span"))
+			.filter(div => div.firstChild?.nodeType === Node.TEXT_NODE && div.dir !== "rtl");
+		const selected: HTMLElement[] = [target];
+		const at = spans.indexOf(target);
+		if (at < 0) return null;
+		const adjacent = (a: HTMLElement, b: HTMLElement): boolean => {
+			const left = a.getBoundingClientRect(), right = b.getBoundingClientRect();
+			return Math.abs(left.top - right.top) < Math.min(left.height, right.height) * 0.4 &&
+				right.left >= left.left && right.left - left.right < Math.max(left.height, right.height);
 		};
-		const range = layer.ownerDocument.createRange();
-		range.setStart(...point(word.index));
-		range.setEnd(...point(word.index + word.segment.length));
-		const selection = layer.ownerDocument.getSelection();
+		for (let i = at - 1; i >= 0 && adjacent(spans[i], selected[0]); i--) selected.unshift(spans[i]);
+		for (let i = at + 1; i < spans.length && adjacent(selected[selected.length - 1], spans[i]); i++) selected.push(spans[i]);
+		let text = "", offset = 0;
+		const starts: number[] = [];
+		for (let i = 0; i < selected.length; i++) {
+			const div = selected[i];
+			if (i && div.getBoundingClientRect().left - selected[i - 1].getBoundingClientRect().right > rect.height * 0.2) text += " ";
+			starts.push(text.length);
+			if (div === target) offset = text.length + Math.max(0, caret.startOffset -
+				(caret.startOffset === (caret.startContainer.textContent?.length ?? 0) ? 1 : 0));
+			text += div.textContent ?? "";
+		}
+		const point = (position: number, end: boolean): Point => {
+			for (let i = 0; i < selected.length; i++) {
+				const node = selected[i].firstChild!;
+				const finish = starts[i] + (node.textContent?.length ?? 0);
+				if (position < finish || (end && position === finish) || i === selected.length - 1)
+					return [node, Math.max(0, Math.min(position - starts[i], node.textContent?.length ?? 0))];
+			}
+			return [target.firstChild!, 0];
+		};
+		if (clicks >= 3) return { start: point(0, false), end: point(text.length, true) };
+		const word = segmenter.segment(text).containing(Math.min(offset, text.length - 1));
+		return word ? { start: point(word.index, false), end: point(word.index + word.segment.length, true) } : null;
+	};
+	const apply = (unit: Unit): void => {
+		const range = doc.createRange();
+		range.setStart(...unit.start); range.setEnd(...unit.end);
+		const selection = doc.getSelection();
 		selection?.removeAllRanges(); selection?.addRange(range);
+	};
+	layer.addEventListener("mousedown", event => {
+		stop();
+		if (event.button !== 0 || event.detail < 2) return;
+		granularity = event.detail;
+		anchor = unitAt(event.clientX, event.clientY, granularity);
+		if (anchor) {
+			event.preventDefault(); apply(anchor);
+			doc.addEventListener("mousemove", move);
+			doc.addEventListener("mouseup", stop, { once: true });
+		}
+	});
+	const move = (event: MouseEvent): void => {
+		if (!anchor || !(event.buttons & 1)) return;
+		const focus = unitAt(event.clientX, event.clientY, granularity);
+		if (!focus) return;
+		const a = doc.createRange(), b = doc.createRange();
+		a.setStart(...anchor.start); a.collapse(true);
+		b.setStart(...focus.start); b.collapse(true);
+		const backwards = b.compareBoundaryPoints(Range.START_TO_START, a) < 0;
+		apply(backwards ? { start: focus.start, end: anchor.end } : { start: anchor.start, end: focus.end });
+		event.preventDefault();
+	};
+	const stop = (): void => { anchor = null; doc.removeEventListener("mousemove", move); };
+	// The browser's dblclick default would otherwise replace our cross-span range.
+	layer.addEventListener("dblclick", event => {
+		const unit = unitAt(event.clientX, event.clientY, 2);
+		if (unit) { event.preventDefault(); apply(unit); }
 	});
 }

@@ -4,6 +4,7 @@ import {
 	buildSingleLineRect,
 	filterMultiLineRects,
 	separateSelectionLines,
+	highlightDisplayRects,
 	sameSelection,
 	RectLike,
 	mergeTextRects,
@@ -97,4 +98,23 @@ test("sameSelection compares page + text identity", () => {
 	assert.equal(sameSelection(base as never, { ...base, text: "xyz" } as never), false);
 	assert.equal(sameSelection(base as never, { ...base, page: 4 } as never), false);
 	assert.equal(sameSelection(null, base as never), false);
+});
+
+
+test("saved highlight top leading shrinks while bottom and stored geometry remain intact", () => {
+ const input = [{ x: 0, y: 100, width: 80, height: 10 }];
+ const [rect] = highlightDisplayRects(input);
+ assert.equal(rect.y, 100.8);
+ assert.equal(rect.y + rect.height, 110);
+ assert.deepEqual(input, [{ x: 0, y: 100, width: 80, height: 10 }]);
+});
+
+test("actual WEFT three-line bands no longer overlap or create dark seams", () => {
+ const rects = highlightDisplayRects([
+  { x: 338.0073, y: 263.7895, width: 220.0249, height: 11.10398 },
+  { x: 319.5230, y: 274.7167, width: 238.5093, height: 11.10398 },
+  { x: 319.5230, y: 285.7239, width: 218.7139, height: 11.10398 },
+ ]);
+ for (let i = 1; i < rects.length; i++) assert.ok(rects[i - 1].y + rects[i - 1].height <= rects[i].y);
+ assert.ok(Math.abs(rects[2].y + rects[2].height - (285.7239 + 11.10398)) < 1e-10);
 });

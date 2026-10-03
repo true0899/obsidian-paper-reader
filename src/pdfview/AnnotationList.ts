@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import { setIcon } from "obsidian";
 import type { Annotation } from "../storage/annotationStore";
 import { inkBoundingRect } from "./InkLayer";
@@ -68,14 +69,14 @@ export class AnnotationList {
 		});
 
 		const header = this.el.createDiv({ cls: "pr-ann-header" });
-		header.createSpan({ text: `标注（${sorted.length}）` });
+		header.createSpan({ text: t("标注（{count}）", { count: sorted.length }) });
 		const exportAll = header.createEl("button", { cls: "clickable-icon" });
 		setIcon(exportAll, "file-output");
-		exportAll.setAttr("aria-label", "全部导出到标注笔记");
+		exportAll.setAttr("aria-label", t("全部导出到标注笔记"));
 		exportAll.addEventListener("click", () => this.callbacks.onExportAll());
 
 		if (sorted.length === 0) {
-			this.el.createDiv({ cls: "pr-ann-empty", text: "暂无标注" });
+			this.el.createDiv({ cls: "pr-ann-empty", text: t("暂无标注") });
 			return;
 		}
 
@@ -97,9 +98,9 @@ export class AnnotationList {
 				const preview = main.createDiv({ cls: "pr-ann-ink-preview" });
 				const svg = inkPreviewSvg(ann);
 				if (svg) preview.appendChild(svg);
-				firstLine.setText("画笔");
+				firstLine.setText(t("画笔"));
 			} else {
-				firstLine.setText(excerpt(ann.text) || "(无文本)");
+				firstLine.setText(excerpt(ann.text) || t("(无文本)"));
 			}
 			const detail =
 				ann.type === "note" && ann.note
@@ -116,7 +117,7 @@ export class AnnotationList {
 
 			const exportBtn = item.createEl("button", { cls: "pr-ann-export clickable-icon" });
 			setIcon(exportBtn, "file-output");
-			exportBtn.setAttr("aria-label", "导出到标注笔记");
+			exportBtn.setAttr("aria-label", t("导出到标注笔记"));
 			exportBtn.addEventListener("click", (e) => {
 				e.stopPropagation();
 				this.callbacks.onExport(ann);

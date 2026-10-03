@@ -1,5 +1,8 @@
+import { t } from "./i18n";
+import { getExtensionViewRegistry, getViewFile } from "./obsidian-internals";
 import { Menu, Notice, Plugin, TFile } from "obsidian";
 import { configureBundledPdfWorker } from "./pdfview/worker";
+import { deleteReadingPositions, trimReadingPositions } from "./pdfview/readingPositions";
 import {
 	PaperReaderView,
 	VIEW_TYPE_PAPER_READER,
@@ -11,7 +14,7 @@ import {
 } from "./settings";
 
 export default class PaperReaderPlugin extends Plugin {
-	settings: PaperReaderSettings = { ...DEFAULT_SETTINGS };
+	settings: PaperReaderSettings = { ...DEFAULT_SETTINGS, readingPositions: {} };
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -71,6 +74,11 @@ export default class PaperReaderPlugin extends Plugin {
 		);
 
 		this.addSettingTab(new PaperReaderSettingTab(this.app, this));
+		this.registerEvent(this.app.vault.on("delete", (file) => {
+			if (deleteReadingPositions(this.settings.readingPositions, file.path)) {
+				void this.saveSettings();
+			}
+		}));
 	}
 
 	async loadSettings(): Promise<void> {
@@ -78,6 +86,7 @@ export default class PaperReaderPlugin extends Plugin {
 		this.settings = {
 			...DEFAULT_SETTINGS,
 			...data,
+			readingPositions: trimReadingPositions(data?.readingPositions),
 			highlightColors: {
 				...DEFAULT_SETTINGS.highlightColors,
 				...(data?.highlightColors ?? {}),
@@ -86,6 +95,7 @@ export default class PaperReaderPlugin extends Plugin {
 	}
 
 	async saveSettings(): Promise<void> {
+		this.settings.readingPositions = trimReadingPositions(this.settings.readingPositions);
 		await this.saveData(this.settings);
 	}
 
@@ -100,11 +110,8 @@ export default class PaperReaderPlugin extends Plugin {
 	 */
 	private takeoverPdfExtension(): void {
 		try {
-			const registry = (
-				this.app as unknown as {
-					viewRegistry: { typeByExtension: Record<string, string> };
-				}
-			).viewRegistry;
+			const registry = getExtensionViewRegistry(this.app);
+			if (!registry) throw new Error("Unsupported extension registry");
 			const coreType = registry.typeByExtension["pdf"];
 			if (coreType) {
 				this.register(() => {
@@ -115,7 +122,7 @@ export default class PaperReaderPlugin extends Plugin {
 			this.registerExtensions(["pdf"], VIEW_TYPE_PAPER_READER);
 		} catch (e) {
 			console.error("[paper-reader] failed to take over .pdf extension", e);
-			new Notice("Paper Reader: 接管 PDF 默认打开失败（不影响其他功能）");
+			new Notice(t("Paper Reader: 接管 PDF 默认打开失败（不影响其他功能）"));
 		}
 	}
 
@@ -125,10 +132,10 @@ export default class PaperReaderPlugin extends Plugin {
 		const page = parseInt(params.page ?? "1", 10);
 		const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
 		if (!(file instanceof TFile) || file.extension !== "pdf") {
-			new Notice(`Paper Reader: 找不到来源文件 (${path || "未知"})`);
+			new Notice(t("Paper Reader: 找不到来源文件 ({path})", { path: path || t("未知") }));
 			return;
 		}
-		void this.openPdf(file, Number.isFinite(page) ? page : 1);
+		void this.openPdf(file, Number.isFinite(page) ? page : 1, params.annotation);
 	}
 
 	/** Move the reading-position record when a file is renamed/moved. */
@@ -146,15 +153,15 @@ export default class PaperReaderPlugin extends Plugin {
 		if (file && file.extension === "pdf") {
 			void this.openPdf(file);
 		} else {
-			new Notice("Paper Reader: 请先打开一个 PDF 文件");
+			new Notice(t("Paper Reader: 请先打开一个 PDF 文件"));
 		}
 	}
 
-	private async openPdf(file: TFile, page?: number): Promise<void> {
+	private async openPdf(file: TFile, page?: number, annotation?: string): Promise<void> {
 		const leaf = this.app.workspace.getLeaf("tab");
 		await leaf.setViewState({
 			type: VIEW_TYPE_PAPER_READER,
-			state: { file: file.path, ...(page ? { page } : {}) },
+			state: { file: file.path, ...(page ? { page } : {}), ...(annotation ? { annotation } : {}) },
 		});
 		await this.app.workspace.revealLeaf(leaf);
 	}
@@ -163,7 +170,7 @@ export default class PaperReaderPlugin extends Plugin {
 	private convertOpenPdfLeaves(): void {
 		this.app.workspace.iterateAllLeaves((leaf) => {
 			if (leaf.view.getViewType() !== "pdf") return;
-			const file = (leaf.view as { file?: TFile | null }).file;
+			const file = getViewFile(leaf.view);
 			if (!(file instanceof TFile) || file.extension !== "pdf") return;
 			void leaf.setViewState({
 				type: VIEW_TYPE_PAPER_READER,

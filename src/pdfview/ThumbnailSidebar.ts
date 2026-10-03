@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import type { PdfRenderer } from "./PdfRenderer";
 import { OutlineNode, OutlineTree } from "../outline/OutlineTree";
 import { AnnotationList, AnnotationListCallbacks } from "./AnnotationList";
@@ -61,6 +62,20 @@ export class ThumbnailSidebar {
 		for (let p = 1; p <= numPages; p++) {
 			const item = this.listEl.createDiv({ cls: "pr-thumb" });
 			item.dataset.pageNumber = String(p);
+			item.setAttribute("role", "button");
+			item.setAttribute("aria-label", t("第 {page} 页", { page: p }));
+			item.tabIndex = p === (this.currentPage || 1) ? 0 : -1;
+			item.addEventListener("keydown", e => {
+				let target = p;
+				if (e.key === "ArrowDown" || e.key === "ArrowRight") target = Math.min(numPages, p + 1);
+				else if (e.key === "ArrowUp" || e.key === "ArrowLeft") target = Math.max(1, p - 1);
+				else if (e.key === "Home") target = 1;
+				else if (e.key === "End") target = numPages;
+				else if (e.key !== "Enter" && e.key !== " ") return;
+				e.preventDefault(); e.stopPropagation();
+				this.items.get(target)?.focus();
+				this.options.onSelect(target);
+			});
 			// reserve space with an approximate aspect ratio, corrected on render
 			item.style.height = `${Math.round(THUMB_WIDTH * PLACEHOLDER_RATIO)}px`;
 			const badge = item.createDiv({ cls: "pr-thumb-badge" });
@@ -122,6 +137,9 @@ export class ThumbnailSidebar {
 		if (this.mode === "thumbs") {
 			for (const [p, item] of this.items) {
 				item.toggleClass("pr-thumb-active", p === page);
+				item.tabIndex = p === page ? 0 : -1;
+				if (p === page) item.setAttribute("aria-current", "page");
+				else item.removeAttribute("aria-current");
 			}
 		} else if (this.followOutline) {
 			this.outlineTree?.setCurrentPage(page);
@@ -154,7 +172,7 @@ export class ThumbnailSidebar {
 		const item = this.items.get(page);
 		if (!item || gen !== this.generation) return;
 		try {
-			const canvas = await this.renderer.renderThumbnail(page, THUMB_WIDTH);
+			const canvas = await this.renderer.renderThumbnail(page, THUMB_WIDTH, this.el.ownerDocument);
 			if (gen !== this.generation || !item.isConnected) return;
 			item.setCssStyles({ height: "" });
 			item.empty();

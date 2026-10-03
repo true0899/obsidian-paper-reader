@@ -1,6 +1,17 @@
 import type { HighlightRect } from "../storage/annotationStore";
 
+export interface SelectionSegment {
+	page: number;
+	rects: HighlightRect[];
+	text: string;
+	textOffset: number;
+	contextBefore: string;
+	contextAfter: string;
+}
+
 export interface SelectionPayload {
+	/** Document-ordered page selections; absent on legacy single-page payloads. */
+	segments?: SelectionSegment[];
 	page: number;
 	rects: HighlightRect[];
 	text: string;
@@ -34,7 +45,7 @@ function elementOf(node: Node | null): Element | null {
 /** Caret (collapsed range) rect at a DOM position — reliable even inside
  *  scaled spans, unlike Range.getClientRects() on transformed elements. */
 function caretRect(node: Node, offset: number): DOMRect | null {
-	const r = document.createRange();
+	const r = node.ownerDocument!.createRange();
 	r.setStart(node, offset);
 	r.collapse(true);
 	const rects = r.getClientRects();
@@ -106,10 +117,11 @@ export function mergeTextRects(raw: RectLike[]): RectLike[] {
 /** Text boxes only: a DOM Range may also include duplicate transformed span boxes. */
 export function textRangeRects(range: Range, root: Node): DOMRect[] {
 	const rects: DOMRect[] = [];
-	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+	const doc = root.ownerDocument!;
+	const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
 	for (let node = walker.nextNode(); node; node = walker.nextNode()) {
 		if (!node.textContent?.trim() || !range.intersectsNode(node)) continue;
-		const part = document.createRange();
+		const part = doc.createRange();
 		part.selectNodeContents(node);
 		if (part.compareBoundaryPoints(Range.START_TO_START, range) < 0) {
 			part.setStart(range.startContainer, range.startOffset);
@@ -145,6 +157,17 @@ export function separateSelectionLines(rects: HighlightRect[]): HighlightRect[] 
 	});
 }
 
+/** Tighten the line-box leading above glyphs without moving its bottom edge.
+ * Stored geometry is retained; this also fixes older overlapping highlights.
+ */
+export function highlightDisplayRects(rects: HighlightRect[]): HighlightRect[] {
+	return separateSelectionLines(rects.map(rect => ({
+		...rect,
+		y: rect.y + rect.height * 0.08,
+		height: rect.height * 0.92,
+	})));
+}
+
 /**
  * Draw the active selection with line-safe bands over the PDF page. The native
  * highlight is suppressed in CSS for the whole text layer; this overlay
@@ -155,7 +178,7 @@ export function separateSelectionLines(rects: HighlightRect[]): HighlightRect[] 
 export function renderSelectionPreview(layer: HTMLElement, rects: HighlightRect[], scale: number): void {
 	layer.replaceChildren();
 	layer.parentElement?.classList.toggle("pr-selection-preview", rects.length > 0);
-	for (const rect of separateSelectionLines(rects)) {
+	for (const rect of highlightDisplayRects(rects)) {
 		const el = layer.createDiv({ cls: "pr-selection-rect" });
 		el.setCssStyles({ backgroundColor: "rgba(122, 96, 255, 0.35)" });
 		el.style.left = `${rect.x * scale}px`;
@@ -165,45 +188,93 @@ export function renderSelectionPreview(layer: HTMLElement, rects: HighlightRect[
 	}
 }
 
-/** Whether two payloads describe the same selection (page + text identity). */
-export function sameSelection(
-	a: SelectionPayload | null,
-	b: SelectionPayload | null
-): boolean {
-	return !!a && !!b && a.page === b.page && a.text === b.text;
+/** Include position so repeated quotations do not share popup state. */
+export function selectionIdentity(payload: SelectionPayload): string {
+	return JSON.stringify((payload.segments ?? [payload]).map(part =>
+		[part.page, part.textOffset, part.text, part.rects]));
 }
 
-/**
- * Best-effort offset of the selected text inside the page's extracted text.
- * DOM selection text and pdf.js extracted text may differ in whitespace,
- * so we fall back to a whitespace-normalised search on a prefix.
- */
-function locateInPageText(
-	pageText: string,
-	selectedText: string
-): { offset: number; length: number } {
-	const needle = selectedText.trim();
-	if (!needle) return { offset: -1, length: 0 };
-	let offset = pageText.indexOf(needle);
-	if (offset >= 0) return { offset, length: needle.length };
-
-	// whitespace-normalised fallback: search a prefix of the selection
-	const prefix = needle.slice(0, 24);
-	offset = pageText.indexOf(prefix);
-	if (offset >= 0) return { offset, length: needle.length };
-	return { offset: -1, length: 0 };
+export function sameSelection(a: SelectionPayload | null, b: SelectionPayload | null): boolean {
+	return !!a && !!b && selectionIdentity(a) === selectionIdentity(b);
 }
 
-/** Visible selection geometry for one page; storage still uses the anchor page. */
+/** Offset at a DOM endpoint using the mapping assigned by the renderer. */
+function pageOffset(layer: HTMLElement, node: Node, offset: number): number {
+	const span = elementOf(node)?.closest<HTMLElement>("[data-pr-text-start]");
+	if (span && layer.contains(span)) {
+		const prefix = layer.ownerDocument.createRange();
+		prefix.selectNodeContents(span);
+		prefix.setEnd(node, offset);
+		return Number(span.dataset.prTextStart) + prefix.toString().length;
+	}
+	const prefix = layer.ownerDocument.createRange();
+	prefix.selectNodeContents(layer);
+	prefix.setEnd(node, offset);
+	const boundary = Range.END_TO_END;
+	let result = 0;
+	for (const div of Array.from(layer.querySelectorAll<HTMLElement>("[data-pr-text-start]"))) {
+		const item = layer.ownerDocument.createRange();
+		item.selectNodeContents(div);
+		if (item.compareBoundaryPoints(boundary, prefix) > 0) break;
+		result = Number(div.dataset.prTextEnd);
+	}
+	// Legacy renderers have no mapping; preserve their concatenated DOM offset.
+	return layer.querySelector("[data-pr-text-start]") ? result : prefix.toString().length;
+}
+
+/** Caret range for editing an existing annotation endpoint. */
+export function rangeFromPageTextOffset(layer: Element, offset: number, end = false): Range | null {
+	const divs = Array.from(layer.querySelectorAll<HTMLElement>("[data-pr-text-start]"));
+	for (let i = 0; i < divs.length; i++) {
+		const div = divs[i], node = div.firstChild;
+		if (node?.nodeType !== Node.TEXT_NODE) continue;
+		if (offset < Number(div.dataset.prTextEnd) || (end && offset === Number(div.dataset.prTextEnd)) || i === divs.length - 1) {
+			const range = layer.ownerDocument.createRange();
+			range.setStart(node, Math.max(0, Math.min(offset - Number(div.dataset.prTextStart), node.textContent?.length ?? 0)));
+			range.collapse(true);
+			return range;
+		}
+	}
+	return null;
+}
+
+/** Search offsets use the same mapped spans as selection, including synthetic line breaks. */
+export function domRangeForText(layer: Element, index: number, length: number): Range | null {
+	const divs = Array.from(layer.querySelectorAll<HTMLElement>("[data-pr-text-start]"));
+	if (!divs.length || length <= 0) return null;
+	const point = (position: number, end: boolean): [Node, number] | null => {
+		const ordered = end ? [...divs].reverse() : divs;
+		for (const div of ordered) {
+			const start = Number(div.dataset.prTextStart), finish = Number(div.dataset.prTextEnd);
+			if (end ? position > start : position < finish) {
+				const node = div.firstChild;
+				if (node?.nodeType === Node.TEXT_NODE) return [node, Math.max(0, Math.min(position - start, node.textContent?.length ?? 0))];
+			}
+		}
+		return null;
+	};
+	const start = point(index, false), end = point(index + length, true);
+	if (!start || !end) return null;
+	const range = layer.ownerDocument.createRange();
+	range.setStart(...start); range.setEnd(...end);
+	return range;
+}
+
+/** Visible selection geometry clipped to one page. */
 export function selectionRectsForPage(
 	selection: Selection,
 	pageEl: HTMLElement,
 	scale: number
 ): HighlightRect[] {
 	if (selection.isCollapsed || selection.rangeCount === 0) return [];
-	const range = selection.getRangeAt(0);
-	if (!range.intersectsNode(pageEl)) return [];
-	const text = selection.toString();
+	const fullRange = selection.getRangeAt(0);
+	if (!fullRange.intersectsNode(pageEl)) return [];
+	const layer = pageEl.querySelector(".textLayer") ?? pageEl;
+	const range = pageEl.ownerDocument.createRange();
+	range.selectNodeContents(layer);
+	if (range.compareBoundaryPoints(Range.START_TO_START, fullRange) < 0) range.setStart(fullRange.startContainer, fullRange.startOffset);
+	if (range.compareBoundaryPoints(Range.END_TO_END, fullRange) > 0) range.setEnd(fullRange.endContainer, fullRange.endOffset);
+	const text = range.toString();
 	const pageRect = pageEl.getBoundingClientRect();
 	const toPageRect = (
 		left: number,
@@ -256,12 +327,10 @@ export function selectionRectsForPage(
 		// A range spanning whole PDF spans includes both element and text boxes.
 		// Measure selected text nodes only, so each glyph run is counted once.
 		const raw = textRangeRects(range, pageEl.querySelector(".textLayer") ?? pageEl);
-		const bandTop =
-			Math.min(startCaret?.top ?? Infinity, endCaret?.top ?? Infinity) - 2;
-		const bandBottom = Math.max(
-			(startCaret ? startCaret.top + startCaret.height : -Infinity),
-			(endCaret ? endCaret.top + endCaret.height : -Infinity)
-		) + 2;
+		// Text-node ranges already clip endpoints. A vertical caret band would
+		// discard selected lines when a range crosses two columns or pages.
+		const bandTop = pageRect.top - 2;
+		const bandBottom = pageRect.bottom + 2;
 		const lineH = Math.max(startCaret?.height ?? 0, endCaret?.height ?? 0);
 		const kept = filterMultiLineRects(
 			mergeTextRects(raw),
@@ -283,45 +352,40 @@ export function selectionRectsForPage(
 	return rects;
 }
 
-/**
- * Map the current DOM selection (inside a pdf.js text layer) to page number,
- * unscaled page rects and a text fingerprint. Returns null when the selection
- * is empty or outside the reader.
- *
- * M1 limitation: only the part of the selection on the anchor page is kept.
- */
+/** Map each selected page independently, using ordered DOM endpoints. */
 export function selectionToPayload(
 	selection: Selection,
 	scale: number,
 	getPageText: (page: number) => string | undefined
 ): SelectionPayload | null {
 	if (selection.isCollapsed || selection.rangeCount === 0) return null;
-	const text = selection.toString();
-	if (!text.trim()) return null;
-
 	const range = selection.getRangeAt(0);
-	const anchorEl = elementOf(selection.anchorNode);
-	const pageEl = anchorEl?.closest(".pr-page");
-	if (!(pageEl instanceof HTMLElement)) return null;
-	const page = Number(pageEl.dataset.pageNumber);
-	if (!Number.isFinite(page)) return null;
-	const rects = selectionRectsForPage(selection, pageEl, scale);
-	if (rects.length === 0) return null;
-
-	const pageText = getPageText(page) ?? "";
-	const { offset, length } = locateInPageText(pageText, text);
-	const contextBefore =
-		offset >= 0 ? pageText.slice(Math.max(0, offset - CONTEXT_LEN), offset) : "";
-	const contextAfter =
-		offset >= 0 ? pageText.slice(offset + length, offset + length + CONTEXT_LEN) : "";
-
-	return {
-		page,
-		rects,
-		text,
-		textOffset: offset,
-		contextBefore,
-		contextAfter,
-		anchorRect: range.getBoundingClientRect(),
-	};
+	const startPage = elementOf(range.startContainer)?.closest<HTMLElement>(".pr-page");
+	const endPage = elementOf(range.endContainer)?.closest<HTMLElement>(".pr-page");
+	const pages = startPage?.closest<HTMLElement>(".pr-pages") ?? startPage?.parentElement;
+	if (!startPage || !endPage || !pages || !pages.contains(endPage)) return null;
+	const segments: SelectionSegment[] = [];
+	for (const pageEl of Array.from(pages.querySelectorAll<HTMLElement>(".pr-page"))) {
+		if (!range.intersectsNode(pageEl)) continue;
+		const layer = pageEl.querySelector<HTMLElement>(".textLayer");
+		const page = Number(pageEl.dataset.pageNumber);
+		if (!layer || !Number.isFinite(page)) continue;
+		const part = layer.ownerDocument.createRange();
+		part.selectNodeContents(layer);
+		if (part.compareBoundaryPoints(Range.START_TO_START, range) < 0) part.setStart(range.startContainer, range.startOffset);
+		if (part.compareBoundaryPoints(Range.END_TO_END, range) > 0) part.setEnd(range.endContainer, range.endOffset);
+		if (part.collapsed) continue;
+		const pageText = getPageText(page) ?? "";
+		const offset = pageOffset(layer, part.startContainer, part.startOffset);
+		const end = pageOffset(layer, part.endContainer, part.endOffset);
+		const text = pageText ? pageText.slice(offset, end) : part.toString();
+		const rects = selectionRectsForPage(selection, pageEl, scale);
+		if (!text.trim() || !rects.length) continue;
+		segments.push({ page, rects, text, textOffset: offset,
+			contextBefore: pageText.slice(Math.max(0, offset - CONTEXT_LEN), offset),
+			contextAfter: pageText.slice(end, end + CONTEXT_LEN) });
+	}
+	if (!segments.length) return null;
+	return { ...segments[0], segments, text: segments.map(part => part.text).join("\n"),
+		anchorRect: range.getBoundingClientRect() };
 }

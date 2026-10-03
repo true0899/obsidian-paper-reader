@@ -2,11 +2,12 @@ import { build } from 'esbuild';
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
+import { readPdfResources } from './pdf-resources.mjs';
 import synthetic from '../tests/fixtures/makePdf.cjs';
 
 const result = await build({ entryPoints: ['tests/e2e/harness.ts'], bundle: true, format: 'esm', write: false,
   alias: { obsidian: './tests/obsidian-stub.ts' },
-  define: { __PDF_WORKER_SOURCE__: JSON.stringify(readFileSync('node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs', 'utf8')) }
+  define: { __PDF_RESOURCES__: JSON.stringify(readPdfResources()), __PDF_WORKER_SOURCE__: JSON.stringify(readFileSync('node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs', 'utf8')) }
 });
 const assets = new Map([
   ['/harness.html', ['text/html', readFileSync('tests/e2e/harness.html')]],

@@ -36,6 +36,15 @@ export class ConfirmationModal {
 		else this.onClose();
 	}
 }
+export class Modal {
+	containerEl = document.createElement("div");
+	titleEl = this.containerEl.appendChild(document.createElement("h2"));
+	contentEl = this.containerEl.appendChild(document.createElement("div"));
+	constructor(_app: App) {}
+	onClose(): void {}
+	open(): void { document.body.appendChild(this.containerEl); }
+	close(): void { this.containerEl.remove(); this.onClose(); }
+}
 export class TFile {}
 export class Component {
 	children: Component[] = [];
@@ -74,3 +83,6 @@ export async function requestUrl(options: { url: string; method?: string; header
 	try { json = JSON.parse(text); } catch {}
 	return { status: response.status, text, json };
 }
+
+// The default fixture uses the user's Chinese UI; i18n tests exercise English explicitly.
+export function getLanguage(): string { return (globalThis as unknown as { __testLanguage?: string }).__testLanguage ?? "zh"; }
