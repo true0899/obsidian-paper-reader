@@ -22,7 +22,11 @@ export class BundledPdfResources {
 		const directory = { cMapUrl: "cmaps", standardFontDataUrl: "standard_fonts", wasmUrl: "wasm" }[kind];
 		const encoded = typeof __PDF_RESOURCES__ === "undefined" ? undefined : __PDF_RESOURCES__[`${directory}/${filename}`];
 		if (!encoded) throw new Error(`Missing bundled PDF resource: ${kind}/${filename}`);
-		return Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
+		const compressed = encoded.startsWith("gzip:");
+		const bytes = Uint8Array.from(atob(compressed ? encoded.slice(5) : encoded), c => c.charCodeAt(0));
+		if (!compressed) return bytes;
+		const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+		return new Uint8Array(await new Response(stream).arrayBuffer());
 	}
 }
 
@@ -103,7 +107,7 @@ export class PdfRenderer {
 		this.pageTexts.clear(); this.pageTextMappings.clear(); this.pageCache.clear();
 		await previous?.destroy();
 		if (generation !== this.generation) return;
-		const task = getDocument({ data, ownerDocument: options.ownerDocument as HTMLDocument | undefined,
+		const task = getDocument({ data, ownerDocument: options.ownerDocument,
 			BinaryDataFactory: BundledPdfResources, useWorkerFetch: false, cMapPacked: true });
 		if (options.onPassword) task.onPassword = options.onPassword;
 		this.loadingTask = task;
@@ -188,9 +192,12 @@ export class PdfRenderer {
 	async getPageLinks(pageNumber: number): Promise<PdfLink[]> {
 		const page = await this.getPage(pageNumber);
 		const annotations = await page.getAnnotations({ intent: "display" });
-		return annotations.filter(a => a.subtype === "Link" && (a.url || a.dest)).map(a => ({
-			url: a.url, dest: a.dest, rect: a.rect,
-		}));
+		return annotations.filter((a: unknown): a is { subtype: string; url?: string; dest?: string | unknown[]; rect: number[] } => {
+			if (!a || typeof a !== "object") return false;
+			const link = a as Record<string, unknown>;
+			return link.subtype === "Link" && (typeof link.url === "string" || typeof link.dest === "string" || Array.isArray(link.dest)) &&
+				Array.isArray(link.rect) && link.rect.length === 4 && link.rect.every(value => typeof value === "number");
+		}).map(a => ({ url: a.url, dest: a.dest, rect: a.rect }));
 	}
 
 	/** Render a small canvas for the thumbnail sidebar. */
@@ -203,7 +210,7 @@ export class PdfRenderer {
 		const base = page.getViewport({ scale: 1 });
 		const viewport = page.getViewport({ scale: targetWidth / base.width });
 		const dpr = Math.max(ownerDocument.defaultView?.devicePixelRatio || 1, 1);
-		const canvas = ownerDocument.createElement("canvas");
+		const canvas = ownerDocument.adoptNode(createEl("canvas"));
 		canvas.width = Math.floor(viewport.width * dpr);
 		canvas.height = Math.floor(viewport.height * dpr);
 		canvas.style.width = `${Math.floor(viewport.width)}px`;
@@ -222,16 +229,15 @@ export class PdfRenderer {
 	 */
 	async createPlaceholder(pageNumber: number, scale: number, ownerDocument: Document = document): Promise<RenderedPage> {
 		const dims = await this.getPageDims(pageNumber);
-		const wrapper = ownerDocument.createElement("div");
+		const wrapper = ownerDocument.adoptNode(createEl("div"));
 		wrapper.className = "pr-page";
 		wrapper.dataset.pageNumber = String(pageNumber);
 		wrapper.style.width = `${Math.floor(dims.width * scale)}px`;
 		wrapper.style.height = `${Math.floor(dims.height * scale)}px`;
 		// CSS vars expected by pdf.js v6 text layer styles
 		wrapper.style.setProperty("--total-scale-factor", String(scale));
-		wrapper.style.setProperty("--scale-round-x", "1px");
-		wrapper.style.setProperty("--scale-round-y", "1px");
-		return { pageNumber, wrapper, highlightLayer: ownerDocument.createElement("div"), selectionLayer: ownerDocument.createElement("div"), inkLayer: ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg"),
+			wrapper.setCssProps({ "--scale-round-x": "1px", "--scale-round-y": "1px" });
+		return { pageNumber, wrapper, highlightLayer: ownerDocument.adoptNode(createEl("div")), selectionLayer: ownerDocument.adoptNode(createEl("div")), inkLayer: ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg"),
 			widthAtScale1: dims.width, heightAtScale1: dims.height };
 	}
 
@@ -270,7 +276,7 @@ export class PdfRenderer {
 		signal?.addEventListener("abort", cancel, { once: true });
 		try {
 
-			const canvas = ownerDocument.createElement("canvas");
+			const canvas = ownerDocument.adoptNode(createEl("canvas"));
 			canvas.className = "pr-canvas"; wrapper.appendChild(canvas);
 			// Bound a single zoomed page to 8 MP; Unicode selection remains full resolution.
 			const outputScale = Math.min(Math.max(ownerDocument.defaultView?.devicePixelRatio || 1, 1), Math.sqrt(8_000_000 / (viewport.width * viewport.height)));
@@ -286,7 +292,7 @@ export class PdfRenderer {
 			await renderTask.promise;
 			check();
 
-			const textLayerEl = ownerDocument.createElement("div");
+			const textLayerEl = ownerDocument.adoptNode(createEl("div"));
 			textLayerEl.className = "textLayer"; wrapper.appendChild(textLayerEl);
 			const [textContent, operatorList] = await Promise.all([page.getTextContent(), page.getOperatorList()]);
 			check();
@@ -327,9 +333,9 @@ export class PdfRenderer {
 			this.pageTexts.set(pageNumber, mapping.text);
 			this.pageTextMappings.set(pageNumber, mapping);
 
-			const highlightLayer = ownerDocument.createElement("div");
+			const highlightLayer = ownerDocument.adoptNode(createEl("div"));
 			highlightLayer.className = "pr-highlight-layer"; wrapper.appendChild(highlightLayer);
-			const selectionLayer = ownerDocument.createElement("div");
+			const selectionLayer = ownerDocument.adoptNode(createEl("div"));
 			selectionLayer.className = "pr-selection-layer"; wrapper.appendChild(selectionLayer);
 
 			const inkLayer = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -345,7 +351,7 @@ export class PdfRenderer {
 				const [a, b, c, d, e, f] = viewport.transform;
 				const [x, y, right, bottom] = link.rect;
 				const [x1, y1, x2, y2] = [a*x+c*y+e, b*x+d*y+f, a*right+c*bottom+e, b*right+d*bottom+f];
-				const anchor = ownerDocument.createElement("a");
+				const anchor = ownerDocument.adoptNode(createEl("a"));
 				anchor.className = "pr-pdf-link";
 				anchor.href = url?.href ?? "#";
 				anchor.setAttribute("aria-label", link.url ?? "跳转到 PDF 页面");
@@ -386,7 +392,7 @@ export class PdfRenderer {
 		state.task?.cancel();
 		state.region = region;
 		const revision = ++state.revision;
-		const canvas = rendered.wrapper.ownerDocument.createElement("canvas");
+		const canvas = rendered.wrapper.ownerDocument.adoptNode(createEl("canvas"));
 		canvas.className = "pr-detail-canvas";
 		canvas.width = Math.max(1, Math.ceil(width * outputScale));
 		canvas.height = Math.max(1, Math.ceil(height * outputScale));

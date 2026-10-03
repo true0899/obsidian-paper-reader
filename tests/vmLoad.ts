@@ -34,6 +34,7 @@ export function loadTs(path: string, imports: Record<string, unknown> = {}): any
 		window: { innerWidth: 1000, innerHeight: 1000, setTimeout, clearTimeout },
 		DOMRect: class {},
 		createDiv: elementStub,
+		createEl: elementStub,
 		crypto,
 		structuredClone,
 	});

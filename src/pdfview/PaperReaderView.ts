@@ -847,7 +847,7 @@ export class PaperReaderView extends ItemView {
 				applyStyle: (style) => void this.applyHeaderStyle(style),
 				onClearHighlight: () => void this.clearHighlightsInSelection(),
 				onCopy: () => void this.copySelection(),
-				onNote: () => this.openNotePopup(),
+				onNote: () => void this.openNotePopup(),
 				onTranslate: () => this.withPayload(p => void this.openAiPanel("translate", p)),
 				onExplain: () => this.withPayload(p => void this.openAiPanel("explain", p)),
 				onAsk: () => this.withPayload(p => void this.openAiPanel("ask", p)),

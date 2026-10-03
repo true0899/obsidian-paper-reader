@@ -5,8 +5,11 @@ import { spawn } from 'node:child_process';
 import { readPdfResources } from './pdf-resources.mjs';
 import synthetic from '../tests/fixtures/makePdf.cjs';
 
-const result = await build({ entryPoints: ['tests/e2e/harness.ts'], bundle: true, format: 'esm', write: false,
+const result = await build({ entryPoints: ['tests/e2e/harness.ts'], bundle: true, format: 'esm', write: false, external: ['node:*'],
   alias: { obsidian: './tests/obsidian-stub.ts' },
+  plugins: [{ name: 'browser-test-transport', setup(build) {
+    build.onLoad({ filter: /src[\\/]llm[\\/]transport\.ts$/ }, () => ({ contents: readFileSync('tests/browserTransport.ts', 'utf8'), loader: 'ts', resolveDir: process.cwd() + '/tests' }));
+  } }],
   define: { __PDF_RESOURCES__: JSON.stringify(readPdfResources()), __PDF_WORKER_SOURCE__: JSON.stringify(readFileSync('node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs', 'utf8')) }
 });
 const assets = new Map([

@@ -8,7 +8,7 @@ test("detail canvas renders visible crop at owner-window DPR and releases pixels
 	const canvases: any[] = [];
 	const requests: any[] = [];
 	let cancelled = 0;
-	const ownerDocument = { defaultView: { devicePixelRatio: 2 }, createElement() {
+	const ownerDocument = { defaultView: { devicePixelRatio: 2 }, adoptNode() {
 		const canvas: any = { style: {}, remove() { this.removed = true; } };
 		canvases.push(canvas); return canvas;
 	} };

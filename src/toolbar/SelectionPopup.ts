@@ -97,7 +97,7 @@ export class SelectionPopup {
 
 	hide(): void {
 		if (this.editTarget && this.noteInput && this.noteInput.value !== (this.editTarget.note ?? "")) this.editDrafts.set(this.editTarget.id, this.noteInput.value);
-		this.flushInkWidth?.();
+		void this.flushInkWidth?.();
 		this.flushInkWidth = null;
 		this.requestAbort?.abort();
 		this.requestAbort = null;
@@ -155,12 +155,12 @@ export class SelectionPopup {
 				dot.addClass("pr-color-dot-active");
 			}
 			dot.setAttr("aria-label", t("标注 {color}", { color: key }));
-			dot.addEventListener("click", async (e) => {
+			dot.addEventListener("click", (e) => {
 				e.stopPropagation();
 				const generation = this.generation;
-				await this.flushInkWidth?.();
-				if (generation !== this.generation) return;
-				this.deps.applyAnnotation(key);
+				void Promise.resolve(this.flushInkWidth?.()).then(() => {
+					if (generation === this.generation) this.deps.applyAnnotation(key);
+				}).catch(error => new Notice(String(error)));
 			});
 		}
 

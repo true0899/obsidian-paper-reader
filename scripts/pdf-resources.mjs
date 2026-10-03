@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
+import { gzipSync } from 'node:zlib';
 
 const root = new URL('../node_modules/pdfjs-dist/', import.meta.url);
 
@@ -8,7 +9,7 @@ export function readPdfResources() {
   for (const directory of ['cmaps', 'standard_fonts', 'wasm']) {
     for (const filename of readdirSync(new URL(`${directory}/`, root))) {
       if (/\.(bcmap|pfb|ttf|wasm)$/.test(filename)) {
-        resources[`${directory}/${filename}`] = readFileSync(new URL(`${directory}/${filename}`, root)).toString('base64');
+        resources[`${directory}/${filename}`] = 'gzip:' + gzipSync(readFileSync(new URL(`${directory}/${filename}`, root)), { level: 9 }).toString('base64');
       }
     }
   }

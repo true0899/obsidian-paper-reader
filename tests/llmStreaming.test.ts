@@ -1,3 +1,4 @@
+globalThis.window = { setTimeout, clearTimeout } as unknown as Window & typeof globalThis;
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
