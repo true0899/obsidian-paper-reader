@@ -9,7 +9,10 @@ export function readPdfResources() {
   for (const directory of ['cmaps', 'standard_fonts', 'wasm']) {
     for (const filename of readdirSync(new URL(`${directory}/`, root))) {
       if (/\.(bcmap|pfb|ttf|wasm)$/.test(filename)) {
-        resources[`${directory}/${filename}`] = 'gzip:' + gzipSync(readFileSync(new URL(`${directory}/${filename}`, root)), { level: 9 }).toString('base64');
+        const packed = gzipSync(readFileSync(new URL(`${directory}/${filename}`, root)), { level: 9 });
+        // Gzip's OS metadata must not change release bytes between macOS and Linux.
+        packed[9] = 3;
+        resources[`${directory}/${filename}`] = 'gzip:' + packed.toString('base64');
       }
     }
   }

@@ -940,7 +940,7 @@ export class PaperReaderView extends ItemView {
 	}
 
 	private closePenMenu(): void {
-		this.penMenuFlush?.(); this.penMenuFlush = null;
+		void this.penMenuFlush?.(); this.penMenuFlush = null;
 		this.penMenuEl?.remove(); this.penMenuEl = null;
 	}
 
