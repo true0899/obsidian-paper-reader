@@ -38,3 +38,35 @@ test("clear wipes all cached state (new document opened)", () => {
 	cache.clear();
 	assert.equal(cache.get(popupCacheKey(payload(1, "abc"))), undefined);
 });
+
+test("cache evicts least recently read entries at the count limit", () => {
+	const cache = new PopupStateCache(2);
+	cache.merge("a", { translation: "first" });
+	cache.merge("b", { translation: "second" });
+	cache.get("a");
+	cache.merge("c", { translation: "third" });
+	assert.equal(cache.get("b"), undefined);
+	assert.equal(cache.get("a")?.translation, "first");
+	assert.equal(cache.get("c")?.translation, "third");
+});
+
+test("cache bounds total text and correctly accounts for replacements and clear", () => {
+	const cache = new PopupStateCache(100, 10);
+	cache.merge("a", { translation: "1234" });
+	cache.merge("b", { translation: "1234" });
+	cache.merge("b", { translation: "123456" });
+	assert.equal(cache.get("a"), undefined);
+	assert.equal(cache.get("b")?.translation, "123456");
+	cache.clear();
+	cache.merge("c", { translation: "123456789" });
+	assert.ok(cache.get("c"));
+	cache.merge("oversize", { translation: "12345678901" });
+	assert.equal(cache.get("oversize"), undefined);
+});
+
+test("mutating a returned cache entry cannot bypass the text limit", () => {
+	const cache = new PopupStateCache(100, 10);
+	cache.merge("a", { translation: "small" });
+	cache.get("a")!.translation = "x".repeat(100);
+	assert.equal(cache.get("a")?.translation, "small");
+});

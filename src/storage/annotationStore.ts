@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import { App, Notice } from "obsidian";
 import { annotationPathFor } from "./paths";
 import { withFileLock } from "./fileQueue";
@@ -26,6 +27,8 @@ export interface InkStroke {
 
 export interface Annotation {
 	id: string;
+	/** One cross-page action, stored as compatible single-page records. */
+	groupId?: string;
 	type: AnnotationType;
 	/** 1-based page number */
 	page: number;
@@ -141,7 +144,7 @@ export class AnnotationStore {
 			}
 			this.corrupted.add(pdfPath);
 			new Notice(
-				`Paper Reader: 标注文件损坏，已进入只读保护（已备份为 ${path.split("/").pop()}.bak）`
+				t("Paper Reader: 标注文件损坏，已进入只读保护（已备份为 {name}.bak）", { name: path.split("/").pop() ?? path })
 			);
 			return emptyAnnotationFile(pdfPath);
 		}
@@ -151,7 +154,7 @@ export class AnnotationStore {
 		const path = this.pathFor(pdfPath);
 		const adapter = this.app.vault.adapter;
 		if (this.corrupted.has(pdfPath)) {
-			new Notice("Paper Reader: 标注文件已损坏，写入已阻断以保护原数据（请修复或删除后重开 PDF）");
+			new Notice(t("Paper Reader: 标注文件已损坏，写入已阻断以保护原数据（请修复或删除后重开 PDF）"));
 			return false;
 		}
 		try {
@@ -164,7 +167,7 @@ export class AnnotationStore {
 				}
 				const expected = this.revision?.path === path ? this.revision.raw : null;
 				if (current !== expected) {
-					new Notice("标注已被其他窗口或同步更新，本次未覆盖。请保留批注草稿，重新打开 PDF 后重试。");
+					new Notice(t("标注已被其他窗口或同步更新，本次未覆盖。请保留批注草稿，重新打开 PDF 后重试。"));
 					return false;
 				}
 				await adapter.write(path, content);
@@ -178,7 +181,7 @@ export class AnnotationStore {
 			});
 		} catch (e) {
 			console.error("[paper-reader] failed to save annotations", e);
-			new Notice(`Paper Reader: 标注写入失败，内存中的标注未丢失，请重试 (${path})`);
+			new Notice(t("Paper Reader: 标注写入失败，内存中的标注未丢失，请重试 ({path})", { path }));
 			return false;
 		}
 	}

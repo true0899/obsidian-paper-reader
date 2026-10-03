@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import { App, Notice, TFile, normalizePath } from "obsidian";
 import { withFileLock } from "./fileQueue";
 
@@ -22,8 +23,8 @@ export function notesPathFor(pdfPath: string, suffix: string): string {
 /** obsidian:// link that reopens the pdf at the given page.
  *  Obsidian only routes obsidian:// URIs to registerObsidianProtocolHandler,
  *  so the action segment must be the plugin id ("paper-reader"). */
-export function backlinkFor(pdfPath: string, page: number): string {
-	return `obsidian://paper-reader?file=${encodeURIComponent(pdfPath)}&page=${page}`;
+export function backlinkFor(pdfPath: string, page: number, annId?: string): string {
+	return `obsidian://paper-reader?file=${encodeURIComponent(pdfPath)}&page=${page}${annId ? `&annotation=${encodeURIComponent(annId)}` : ""}`;
 }
 
 function formatTime(d: Date): string {
@@ -77,7 +78,7 @@ export async function appendManyToNotes(
 		return { marker, text:
 			`\n\n## ${entry.title} · p.${entry.page} · ${formatTime(new Date())}\n\n` +
 			`${quote ? quote + "\n\n" : ""}${entry.content}\n\n` +
-			`[→ 回到原文 p.${entry.page}](${backlinkFor(pdfPath, entry.page)}) ${marker}\n` };
+			`[→ 回到原文 p.${entry.page}](${backlinkFor(pdfPath, entry.page, entry.annId)}) ${marker}\n` };
 	});
 	try {
 		return await withFileLock(app.vault.adapter, path, async () => {
@@ -97,24 +98,24 @@ export async function appendManyToNotes(
 					`# ${pdfName.replace(/\.pdf$/i, "")} 标注笔记\n`;
 				try {
 					await app.vault.create(path, update(initial));
-					new Notice(`已插入标注笔记：${path.split("/").pop()}`);
+					new Notice(t("已插入标注笔记：{name}", { name: path.split("/").pop() ?? path }));
 					return true;
 				} catch (error) {
 					file = app.vault.getAbstractFileByPath(path);
 					if (!file) throw error;
 				}
 			}
-			if (!(file instanceof TFile)) throw new Error("笔记目标不是文件");
+			if (!(file instanceof TFile)) throw new Error(t("笔记目标不是文件"));
 			let changed = false;
 			await app.vault.process(file, before => {
 				const after = update(before); changed = after !== before; return after;
 			});
-			new Notice(changed ? `已插入标注笔记：${path.split("/").pop()}` : "该标注已导出过，已跳过");
+			new Notice(changed ? t("已插入标注笔记：{name}", { name: path.split("/").pop() ?? path }) : t("该标注已导出过，已跳过"));
 			return changed;
 		});
 	} catch (e) {
 		console.error("[paper-reader] failed to append notes", e);
-		new Notice(`写入标注笔记失败 (${path})`);
+		new Notice(t("写入标注笔记失败 ({path})", { path }));
 		return false;
 	}
 }

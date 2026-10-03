@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import { App } from 'obsidian';
 import { LlmClient } from '../src/llm/client';
 
-test('AI blocks unsafe endpoints, cancellation sends nothing, and a changed endpoint needs consent', async () => {
+test('AI blocks unsafe endpoints and configured requests never show a confirmation', async () => {
  const oldWindow = globalThis.window;
  const oldFetch = globalThis.fetch;
- let prompts = 0, requests = 0, allow = false;
+ let prompts = 0, requests = 0;
  let baseUrl = 'http://example.com/v1';
- globalThis.window = { confirm: () => { prompts++; return allow; }, setTimeout, clearTimeout } as any;
+ globalThis.window = { confirm: () => { prompts++; throw new Error("Unexpected confirmation"); }, setTimeout, clearTimeout } as any;
  globalThis.fetch = (async (_url, options) => {
   requests++;
   assert.equal(options?.redirect, 'error');
@@ -23,14 +23,12 @@ test('AI blocks unsafe endpoints, cancellation sends nothing, and a changed endp
   }
   assert.equal(prompts, 0); assert.equal(requests, 0);
   baseUrl = 'https://example.com/v1';
-  await assert.rejects(send, /已取消/);
-  assert.equal(requests, 0);
-  allow = true;
   await send(); await send();
-  assert.equal(prompts, 2); assert.equal(requests, 2);
+  assert.equal(prompts, 0); assert.equal(requests, 2);
   baseUrl = 'https://other.example/v1'; await send();
-  assert.equal(prompts, 3);
+  assert.equal(prompts, 0);
   for (baseUrl of ['http://localhost:1234/v1', 'http://127.0.0.1:1234/v1', 'http://[::1]:1234/v1']) await send();
   assert.equal(requests, 6);
+  assert.equal(prompts, 0);
  } finally { globalThis.window = oldWindow; globalThis.fetch = oldFetch; }
 });

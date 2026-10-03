@@ -1,6 +1,7 @@
 import type { Annotation, InkStroke } from "../storage/annotationStore";
 
 export type HistoryOp =
+	| { kind: "batch"; ops: HistoryOp[] }
 	| { kind: "add"; ann: Annotation }
 	| { kind: "remove"; anns: Annotation[]; indexes: number[] }
 	| { kind: "update"; before: Annotation; after: Annotation };

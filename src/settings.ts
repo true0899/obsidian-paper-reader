@@ -1,3 +1,4 @@
+import { t } from "./i18n";
 import { App, Notice, PluginSettingTab } from "obsidian";
 import type { SettingDefinitionItem } from "obsidian";
 import type PaperReaderPlugin from "./main";
@@ -64,21 +65,28 @@ export const DEFAULT_SETTINGS: PaperReaderSettings = {
 	llmApiKey: "",
 	llmModel: "",
 	translateTargetLang: "中文",
-	aiContextLevel: "page",
+	aiContextLevel: "full",
 	readingPositions: {},
 };
 
 const COLOR_LABELS: Record<HighlightColorKey, string> = {
-	yellow: "黄色（重点）",
-	red: "红色（疑问）",
-	green: "绿色（方法）",
-	blue: "蓝色（概念）",
-	purple: "紫色",
-	pink: "粉色",
-	orange: "橙色",
+	yellow: t("黄色（重点）"),
+	red: t("红色（疑问）"),
+	green: t("绿色（方法）"),
+	blue: t("蓝色（概念）"),
+	purple: t("紫色"),
+	pink: t("粉色"),
+	orange: t("橙色"),
 };
 
 export class PaperReaderSettingTab extends PluginSettingTab {
+	private testAbort: AbortController | null = null;
+
+	hide(): void {
+		this.testAbort?.abort();
+		this.testAbort = null;
+		super.hide();
+	}
 	constructor(
 		app: App,
 		private plugin: PaperReaderPlugin
@@ -88,49 +96,53 @@ export class PaperReaderSettingTab extends PluginSettingTab {
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
 		return [
-			{ type: "group", heading: "高亮颜色", items: COLOR_KEYS.map((key) => ({
+			{ type: "group", heading: t("高亮颜色"), items: COLOR_KEYS.map((key) => ({
 				name: COLOR_LABELS[key],
-				desc: "点击色块自定义颜色值",
+				desc: t("点击色块自定义颜色值"),
 				control: { type: "color", key: `color.${key}` },
 			})) },
-			{ type: "group", heading: "标注存储", items: [
-				{ name: "标注文件后缀", desc: "例如 paper.pdf -> paper.annotations.json", control: { type: "text", key: "annotationSuffix", placeholder: ".annotations.json" } },
-				{ name: "标注笔记后缀", desc: "例如 paper.pdf -> paper.notes.md", control: { type: "text", key: "notesSuffix", placeholder: ".notes.md" } },
+			{ type: "group", heading: t("标注存储"), items: [
+				{ name: t("标注文件后缀"), desc: t("例如 paper.pdf -> paper.annotations.json"), control: { type: "text", key: "annotationSuffix", placeholder: ".annotations.json" } },
+				{ name: t("标注笔记后缀"), desc: t("例如 paper.pdf -> paper.notes.md"), control: { type: "text", key: "notesSuffix", placeholder: ".notes.md" } },
 			] },
-			{ type: "group", heading: "交互", items: [
-				{ name: "默认 PDF 阅读器", desc: "接管 .pdf 文件（更改后需重载插件）", control: { type: "toggle", key: "useAsDefaultPdfViewer" } },
-				{ name: "Selection popup", desc: "选中文字后弹出选区弹窗", control: { type: "toggle", key: "showFloatingToolbar" } },
+			{ type: "group", heading: t("交互"), items: [
+				{ name: t("默认 PDF 阅读器"), desc: t("接管 .pdf 文件（更改后需重载插件）"), control: { type: "toggle", key: "useAsDefaultPdfViewer" } },
+				{ name: "Selection popup", desc: t("选中文字后弹出选区弹窗"), control: { type: "toggle", key: "showFloatingToolbar" } },
 			] },
 			{ type: "group", heading: "LLM", items: [
-				{ name: "Base URL", desc: "OpenAI 兼容接口地址", control: { type: "text", key: "llmBaseUrl", placeholder: "https://api.deepseek.com/v1" } },
-				{ name: "API Key", desc: "密钥明文保存在插件 data.json 中，请勿公开上传", render: (setting) => setting.addText((text) => {
+				{ name: "Base URL", desc: t("OpenAI 兼容接口地址"), control: { type: "text", key: "llmBaseUrl", placeholder: "https://api.deepseek.com/v1" } },
+				{ name: "API Key", desc: t("密钥明文保存在插件 data.json 中，请勿公开上传"), render: (setting) => setting.addText((text) => {
 					text.inputEl.type = "password";
 					text.setPlaceholder("sk-...").setValue(this.plugin.settings.llmApiKey).onChange(async (value) => {
 						this.plugin.settings.llmApiKey = value.trim();
 						await this.plugin.saveSettings();
 					});
 				}) },
-				{ name: "模型名", desc: "如 deepseek-chat / gpt-4o-mini", control: { type: "text", key: "llmModel", placeholder: "deepseek-chat" } },
-				{ name: "测试连接", desc: "发送一个最小请求验证上述配置", render: (setting) => {
+				{ name: t("模型名"), desc: t("如 deepseek-chat / gpt-4o-mini"), control: { type: "text", key: "llmModel", placeholder: "deepseek-chat" } },
+				{ name: t("测试连接"), desc: t("发送一个最小请求验证上述配置"), render: (setting) => {
 					const resultEl = setting.controlEl.createSpan({ cls: "pr-test-result" });
-					setting.addButton((button) => button.setButtonText("测试").onClick(async () => {
-						button.setButtonText("测试中…").setDisabled(true);
+					setting.addButton((button) => button.setButtonText(t("测试")).onClick(async () => {
+						button.setButtonText(t("测试中…")).setDisabled(true);
 						resultEl.setText("");
 						const client = new LlmClient(this.app, () => ({
 							baseUrl: this.plugin.settings.llmBaseUrl,
 							apiKey: this.plugin.settings.llmApiKey,
 							model: this.plugin.settings.llmModel,
 						}));
-						const result = await client.testConnection();
-						button.setButtonText("测试").setDisabled(false);
-						resultEl.setText(result.ok ? "✅ 连接成功" : `❌ ${result.error ?? "未知错误"}`);
+						this.testAbort?.abort();
+						const abort = new AbortController(); this.testAbort = abort;
+						const result = await client.testConnection(abort.signal);
+						if (abort.signal.aborted) return;
+						this.testAbort = null;
+						button.setButtonText(t("测试")).setDisabled(false);
+						resultEl.setText(result.ok ? t("✅ 连接成功") : `❌ ${result.error ?? t("未知错误")}`);
 						resultEl.toggleClass("pr-test-error", !result.ok);
-						if (!result.ok) new Notice(`连接失败：${result.error ?? "未知错误"}`);
+						if (!result.ok) new Notice(t("连接失败：{error}", { error: result.error ?? t("未知错误") }));
 					}));
 				} },
-				{ name: "翻译目标语言", control: { type: "text", key: "translateTargetLang", placeholder: "中文" } },
-				{ name: "AI 上下文级别", desc: "AI 解释/问答时携带的上下文范围", control: { type: "dropdown", key: "aiContextLevel", options: {
-					selection: "仅选中文本", page: "选中文本 + 当前页全文", full: "选中文本 + 全文（超限截断）",
+				{ name: t("翻译目标语言"), control: { type: "text", key: "translateTargetLang", placeholder: t("中文") } },
+				{ name: t("AI 上下文级别"), desc: t("AI 解释/问答时携带的上下文范围"), control: { type: "dropdown", key: "aiContextLevel", options: {
+					selection: t("仅选中文本"), page: t("选中文本 + 当前页全文"), full: t("选中文本 + 全文（超限截断）"),
 				} } },
 			] },
 		];

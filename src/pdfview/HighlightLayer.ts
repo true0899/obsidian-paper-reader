@@ -1,5 +1,6 @@
 import { setIcon } from "obsidian";
 import type { Annotation, HighlightRect } from "../storage/annotationStore";
+import { highlightDisplayRects } from "./selection";
 
 export type HighlightClickHandler = (
 	annotation: Annotation,
@@ -21,13 +22,14 @@ function hexToRgba(hex: string, alpha: number): string {
 
 /** repeating SVG wave used as background-image for wavy annotations */
 function wavyBackground(color: string, scale: number): string {
-	const w = 8;
-	const h = Math.max(3, Math.round(3 * scale));
-	const stroke = Math.max(1, 1.5 * scale);
+	// A centered, shallow wave leaves room for both crests and troughs.
+	// Keep the geometry in PDF units so zoom does not change its proportions.
+	const w = 10 * scale;
+	const h = 4 * scale;
 	const svg =
-		`<svg xmlns='http://www.w3.org/2000/svg' width='${w}' height='${h}'>` +
-		`<path d='M0 ${h - 1} Q ${w / 4} 0 ${w / 2} ${h - 1} T ${w} ${h - 1}' ` +
-		`fill='none' stroke='${color}' stroke-width='${stroke}'/></svg>`;
+		`<svg xmlns='http://www.w3.org/2000/svg' width='${w}' height='${h}' viewBox='0 0 10 4'>` +
+		`<path d='M0 2 C1.667 .667 3.333 .667 5 2 C6.667 3.333 8.333 3.333 10 2' ` +
+		`fill='none' stroke='${color}' stroke-width='.85'/></svg>`;
 	return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
 }
 
@@ -37,6 +39,8 @@ function styleRect(
 	colorHex: string,
 	scale: number
 ): void {
+	// Annotation bands must join with square edges, including note fills.
+	el.style.borderRadius = "0";
 	const style = ann.style ?? "highlight";
 	if (ann.type === "note") {
 		// notes: light fill, distinct from highlights
@@ -70,7 +74,8 @@ export function renderHighlightRects(
 	annotations: Annotation[],
 	scale: number,
 	colors: Record<string, string>,
-	onClick: HighlightClickHandler
+	onClick: HighlightClickHandler,
+	selectedIds: readonly string[] = []
 ): void {
 	layerEl.empty();
 	const pageEl = layerEl.parentElement;
@@ -102,7 +107,9 @@ export function renderHighlightRects(
 	}
 	for (const ann of annotations) {
 		const color = colors[ann.color] ?? ann.color;
-		for (const rect of ann.rects) {
+		const displayRects = ann.type === "highlight" && (ann.style ?? "highlight") === "highlight"
+			? highlightDisplayRects(ann.rects) : ann.rects;
+		for (const rect of displayRects) {
 			const el = layerEl.createDiv({ cls: "pr-highlight-rect" });
 			el.dataset.annotationId = ann.id;
 			el.style.left = `${rect.x * scale}px`;
@@ -110,6 +117,15 @@ export function renderHighlightRects(
 			el.style.width = `${rect.width * scale}px`;
 			el.style.height = `${rect.height * scale}px`;
 			styleRect(el, ann, color, scale);
+		}
+		if (selectedIds.includes(ann.id) && ann.rects.length) {
+			const left = Math.min(...displayRects.map(r => r.x));
+			const top = Math.min(...displayRects.map(r => r.y));
+			const right = Math.max(...displayRects.map(r => r.x + r.width));
+			const bottom = Math.max(...displayRects.map(r => r.y + r.height));
+			const selected = layerEl.createDiv({ cls: "pr-highlight-selection" });
+			selected.dataset.annotationId = ann.id;
+			selected.setCssStyles({ left: `${left * scale}px`, top: `${top * scale}px`, width: `${(right - left) * scale}px`, height: `${(bottom - top) * scale}px` });
 		}
 		// note marker icon at the end of the last rect
 		if (ann.type === "note" && ann.rects.length > 0) {

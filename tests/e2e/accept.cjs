@@ -13,10 +13,28 @@ function check(label, cond, detail = "") {
 
 (async () => {
 	const browser = await chromium.launch();
-	const page = await browser.newPage();
+	const page = await browser.newPage({ deviceScaleFactor: 2 });
 	page.on("pageerror", (e) => { failures++; console.log("[pageerror]", e.message); });
 
 	await page.goto(process.env.PR_TEST_URL || "http://127.0.0.1:8931/harness.html");
+	if (process.env.PR_E2E_CONTROLS_ONLY) {
+		await require("./readerControls.cjs")(page, check);
+		await page.evaluate(() => window.__h.closeReader());
+		const english = await browser.newPage();
+	await english.addInitScript(() => { globalThis.__testLanguage = "en"; });
+	await english.goto(process.env.PR_TEST_URL);
+	await english.waitForFunction(() => !!window.__h);
+	await english.evaluate(() => window.__h.openReader());
+	const englishUi = await english.evaluate(() => {
+		const labels = [...window.__h.reader.headerEl.querySelectorAll("button")].map(b => b.getAttribute("aria-label") || b.textContent);
+		return { zoom: labels.includes("Zoom out"), select: labels.includes("Select text"), comment: labels.includes("Comment"), chinese: labels.some(label => /[\u3400-\u9fff]/.test(label || "")) };
+	});
+	check("英文界面使用宿主语言", englishUi.zoom && englishUi.select && englishUi.comment && !englishUi.chinese, JSON.stringify(englishUi));
+	await english.close();
+	await browser.close();
+		process.exitCode = failures ? 1 : 0;
+		return;
+	}
 	// Load the actual three-file production bundle, then use its embedded worker.
 	const bundledWorker = await page.evaluate(async () => {
 		const urls = [];
@@ -54,6 +72,8 @@ function check(label, cond, detail = "") {
 	});
 	// Times-Roman PDF advances for “Landslide” total 3944/1000 em, at 20 pt.
 	check("逐字选区端点对应 PDF 字宽", precise.text === "Landslide" && Math.abs(precise.right - (40 + 78.88) * 1.5) < 0.5, JSON.stringify(precise));
+	const splitWord = await page.evaluate(() => window.__h.splitWordHighlights());
+	check("单词分两次高亮：直角、边界连续且标注独立", Math.abs(splitWord.gap) < 0.05 && splitWord.radius === "0px" && splitWord.noteRadius === "0px" && splitWord.separateAnnotations, JSON.stringify(splitWord));
 	const preview = await page.evaluate(() => window.__h.previewTitleSelection());
 	check("多行实时选区可见且不会叠色", preview.bands === 3 && !preview.overlaps && preview.nativeHidden && preview.fillVisible && preview.text.includes("LandslideAgent"), JSON.stringify(preview));
 	await page.evaluate(() => window.__h.clearSelectionPreview());
@@ -89,13 +109,9 @@ function check(label, cond, detail = "") {
 	const afterReload = await page.evaluate(() => window.__h.renderedNoteInfo());
 	check("重开后批注矩形/图标仍渲染", afterReload.rects >= 1 && afterReload.icons === 1);
 
-	// Confirm the visible disclosure before the mocked AI request.
-	page.once("dialog", async dialog => {
-		check("AI 首次发送提示显示接收方和数据范围", dialog.type() === "confirm" &&
-			dialog.message().includes("https://mock.local/v1/chat/completions") &&
-			dialog.message().includes("对话历史") && dialog.message().includes("data.json"));
-		await dialog.accept();
-	});
+	let aiDialogs = 0;
+	const unexpectedDialog = async dialog => { aiDialogs++; await dialog.dismiss(); };
+	page.on("dialog", unexpectedDialog);
 	// 4) translate with mocked SSE
 	const tr = await page.evaluate(async () => {
 		const p = window.__h.selectText("Domain-Rule-Augmented", 0, 15);
@@ -103,6 +119,8 @@ function check(label, cond, detail = "") {
 		return { out, anns: window.__h.data.annotations.length };
 	});
 	check("翻译流式返回 mock 译文", tr.out === "滑坡智能体", tr.out);
+	page.off("dialog", unexpectedDialog);
+	check("首次翻译直接执行，不弹确认", aiDialogs === 0);
 	check("翻译记录为 translation 标注", tr.anns >= 2);
 
 	// 5) insert into notes.md
@@ -249,6 +267,46 @@ function check(label, cond, detail = "") {
 	const window30 = await page.evaluate(() => window.__h.openReader());
 	check("30 页只渲染视口附近页面", window30.pages === 30 && window30.mounted.length <= 8 && window30.mounted.length > 0 && !window30.failures.length, JSON.stringify(window30));
 
+	const toolbar = await page.evaluate(() => {
+		const v = window.__h.reader;
+		const rect = el => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, middle: (r.left + r.right) / 2 }; };
+		return { left: rect(v.headerEl.querySelector(".pr-header-start")), center: rect(v.headerEl.querySelector(".pr-header-center")), right: rect(v.headerEl.querySelector(".pr-header-end")), header: rect(v.headerEl), label: v.pageInputEl.value, count: v.pageTotalEl.textContent };
+	});
+	check("工具栏采用左导航、中间批注、右操作布局", toolbar.left.right < toolbar.center.left && toolbar.center.right < toolbar.right.left && Math.abs(toolbar.center.middle - toolbar.header.middle) < 2 && toolbar.label === "i" && toolbar.count === "1 / 30", JSON.stringify(toolbar));
+	await page.getByRole("button", { name: "下一页", exact: true }).click();
+	await page.waitForFunction(() => window.__h.reader.currentPage === 2);
+	await page.getByRole("textbox", { name: "页码", exact: true }).fill("iii");
+	await page.getByRole("textbox", { name: "页码", exact: true }).press("Enter");
+	await page.waitForFunction(() => window.__h.reader.currentPage === 3);
+	check("页码框按 PDF 标签跳转并显示实际页数", await page.evaluate(() => window.__h.reader.pageInputEl.value === "iii" && window.__h.reader.pageTotalEl.textContent === "3 / 30"));
+	await page.getByRole("textbox", { name: "页码", exact: true }).fill("1");
+	await page.getByRole("textbox", { name: "页码", exact: true }).press("Enter");
+	await page.waitForFunction(() => window.__h.reader.currentPage === 1);
+	await page.getByRole("button", { name: "更多选区操作", exact: true }).click();
+	await page.waitForFunction(() => !!window.__h.reader.headerEl.querySelector(".pr-actions-extra").style.top);
+	const moreMenu = await page.evaluate(() => {
+		const menu = window.__h.reader.headerEl.querySelector(".pr-actions-extra"), box = menu.getBoundingClientRect();
+		return { open: menu.parentElement.open, visible: getComputedStyle(menu).display, right: box.right, bottom: box.bottom, width: innerWidth, height: innerHeight, text: menu.textContent, hit: menu.contains(document.elementFromPoint(box.left + 12, box.top + 12)) };
+	});
+	check("更多菜单保留复制与 AI 操作且位于可视区域", moreMenu.open && moreMenu.hit && moreMenu.right <= moreMenu.width && moreMenu.bottom <= moreMenu.height && moreMenu.text.includes("AI 问答") && moreMenu.text.includes("复制"), JSON.stringify(moreMenu));
+	await page.getByRole("button", { name: "更多选区操作", exact: true }).press("Escape");
+	await page.getByRole("button", { name: "搜索文档 (Cmd/Ctrl+F)", exact: true }).click();
+	check("右侧搜索按钮打开搜索栏", await page.evaluate(() => !window.__h.reader.searchBarEl.classList.contains("pr-hidden")));
+	await page.evaluate(() => window.__h.reader.closeSearch());
+	await page.screenshot({ path: "/tmp/paper-reader-toolbar.png" });
+	const pdfLinks = await page.evaluate(() => {
+		const v = window.__h.reader;
+		const external = v.pagesEl.querySelector('a[href="https://example.com/paper"]');
+		let prevented = null;
+		external.addEventListener("click", event => { prevented = event.defaultPrevented; event.preventDefault(); }, { once: true });
+		external.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+		return { prevented, target: external.target, label: v.pageLabels[0], links: v.pagesEl.querySelectorAll(".pr-pdf-link").length };
+	});
+	check("PDF 外链保留打开行为，页码标签已加载", pdfLinks.prevented === false && pdfLinks.target === "_blank" && pdfLinks.label === "i" && pdfLinks.links === 2, JSON.stringify(pdfLinks));
+	await page.locator('[aria-label="跳转到 PDF 页面"]').click();
+	await page.waitForFunction(() => window.__h.reader.currentPage === 2);
+	await page.evaluate(() => window.__h.reader.goBack());
+	check("PDF 内链可跳页并返回原位置", await page.evaluate(() => window.__h.reader.currentPage === 1));
 	// Native selection is transparent; the reader supplies the drag preview.
 	const dragLine = await page.evaluate(() => {
 		const v = window.__h.reader;
@@ -300,10 +358,53 @@ function check(label, cond, detail = "") {
 		document.dispatchEvent(new Event("selectionchange"));
 		await new Promise(requestAnimationFrame);
 		const reverse = pages.slice(0, 2).map(p => p.selectionLayer.children.length);
+		v.refreshSelectionState();
+		const payload = v.currentPayload;
+		await v.commitHighlight("yellow", payload);
+		const saved = v.data.annotations.map(a => ({ page: a.page, text: a.text, groupId: a.groupId }));
+		await v.history.undo(); const afterUndo = v.data.annotations.length;
+		await v.history.redo();
+		const disk = await v.store.load(v.file.path);
 		v.clearSelection();
-		return { bands, reverse, pages: pages.slice(0, 2).map(p => p.pageNumber) };
+		return { bands, reverse, pages: pages.slice(0, 2).map(p => p.pageNumber), saved, afterUndo, restored: disk.annotations.length };
 	});
 	check("跨页正反向选区两页均有可见色带", acrossPages.bands?.every(count => count > 0) && acrossPages.reverse?.every(count => count > 0), JSON.stringify(acrossPages));
+	check("跨页高亮按页保存并整组撤销、重做", acrossPages.saved?.length === 2 && acrossPages.saved.every(a => a.text.length > 0) && acrossPages.saved[0].groupId === acrossPages.saved[1].groupId && acrossPages.afterUndo === 0 && acrossPages.restored === 2, JSON.stringify(acrossPages));
+	const handles = await page.evaluate(async () => {
+		const v = window.__h.reader; await v.scrollToPage(1);
+		const spans = Array.from(v.pages[0].wrapper.querySelectorAll(".textLayer span"));
+		const node = spans[0].firstChild;
+		const endpoint = offset => { const span = spans.find(s => Number(s.dataset.prTextStart) < offset && Number(s.dataset.prTextEnd) >= offset); return [span.firstChild, offset - Number(span.dataset.prTextStart)]; };
+		const [endNode, endOffset] = endpoint(9);
+		window.getSelection().setBaseAndExtent(node, 0, endNode, endOffset);
+		v.refreshSelectionState(); await v.commitHighlight("yellow", v.currentPayload);
+		const ann = v.data.annotations.at(-1); v.activeAnnotationId = ann.id;
+		await v.beginRangeEdit();
+		const caret = document.createRange(); const [targetNode, targetOffset] = endpoint(3); caret.setStart(targetNode, targetOffset); caret.collapse(true);
+		const b = caret.getClientRects()[0];
+		return { id: ann.id, count: v.pagesEl.querySelectorAll(".pr-range-handle").length, x: b.left, y: b.top + b.height / 2 };
+	});
+	check("已有高亮显示两端范围手柄", handles.count === 2, JSON.stringify(handles));
+	const endHandle = await page.locator('[aria-label="调整高亮结束位置"]').boundingBox();
+	await page.mouse.move(endHandle.x + endHandle.width / 2, endHandle.y + endHandle.height / 2);
+	await page.mouse.down(); await page.mouse.move(handles.x, handles.y, { steps: 5 }); await page.mouse.up();
+	await page.waitForFunction(id => window.__h.reader.data.annotations.find(a => a.id === id)?.text === "Syn", handles.id);
+	const rangeSaved = await page.evaluate(async id => {
+		const v = window.__h.reader;
+		const disk = await v.store.load(v.file.path);
+		const text = disk.annotations.find(a => a.id === id)?.text;
+		await v.history.undo();
+		return { text, undo: v.data.annotations.find(a => a.id === id)?.text };
+	}, handles.id);
+	check("拖动范围手柄保存文字，撤销恢复原范围", rangeSaved.text === "Syn" && rangeSaved.undo === "Synthetic", JSON.stringify(rangeSaved));
+	const renderOrder = await page.evaluate(async () => {
+		const v = window.__h.reader, order = [];
+		const original = v.renderer.renderPage.bind(v.renderer);
+		v.renderer.renderPage = (...args) => { order.push(args[0]); return original(...args); };
+		try { await v.scrollToPage(20); return order; }
+		finally { v.renderer.renderPage = original; }
+	});
+	check("远跳优先渲染当前可见页", renderOrder[0] === 20, JSON.stringify(renderOrder));
 	const last = await page.evaluate(() => window.__h.readerNavigate(30));
 	check("远跳释放旧页面并加载末页", last.mounted.includes(30) && !last.mounted.includes(1) && last.mounted.length <= 8, JSON.stringify(last));
 	const windowSearch = await page.evaluate(async () => {
@@ -339,8 +440,116 @@ function check(label, cond, detail = "") {
 	check("快速远跳不会挂回过期页面", cancelled.current === 2 && cancelled.mounted.includes(2) && !cancelled.mounted.includes(28) && !cancelled.failures.length, JSON.stringify(cancelled));
 	const zoomed = await page.evaluate(async () => { await window.__h.reader.zoomBy(10); return window.__h.readerStats(); });
 	check("高倍缩放单页像素预算有效", zoomed.maxPixels <= 8000000 && !zoomed.failures.length, JSON.stringify(zoomed));
+	check("高倍缩放仍预加载前后相邻页", zoomed.mounted.includes(1) && zoomed.mounted.includes(2) && zoomed.mounted.includes(3), JSON.stringify(zoomed));
+	const cachedFlip = await page.evaluate(async () => {
+		const v = window.__h.reader, order = [];
+		const original = v.renderer.renderPage.bind(v.renderer);
+		v.renderer.renderPage = (...args) => { order.push(args[0]); return original(...args); };
+		try { await v.scrollToPage(3); await v.scrollToPage(2); return order; }
+		finally { v.renderer.renderPage = original; }
+	});
+	check("相邻页翻阅直接使用已渲染页面", !cachedFlip.includes(3) && !cachedFlip.includes(2), JSON.stringify(cachedFlip));
+	const detail = await page.evaluate(async () => {
+		const v = window.__h.reader;
+		v.scrollToRect(2, { x: 30, y: 242, width: 80, height: 20 });
+		const bounds = v.scrollEl.getBoundingClientRect();
+		await Promise.all(v.pages.filter(p => v.mountedPages.has(p.pageNumber)).map(p => v.renderer.updateDetail(p, bounds)));
+		const canvas = v.pagesEl.querySelector(".pr-detail-canvas");
+		let ink = 0;
+		if (canvas) { const pixels = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data; for (let i = 0; i < pixels.length; i += 4) if (pixels[i] < 150 && pixels[i + 3] > 0) ink++; }
+		return canvas ? { pixels: canvas.width * canvas.height, ratio: canvas.width / parseFloat(canvas.style.width), dpr: window.devicePixelRatio, ink } : null;
+	});
+	check("高倍缩放可见区域使用高清裁剪画布", detail?.ratio >= detail?.dpr - 0.01 && detail.pixels <= 8000000 && detail.ink > 50, JSON.stringify(detail));
 	const window300 = await page.evaluate(() => window.__h.openReader("/large.pdf"));
 	check("300 页首屏资源不随全文增长", window300.pages === 300 && window300.mounted.length <= 8 && window300.canvasBytes <= window30.canvasBytes * 1.1, JSON.stringify(window300));
+	const earlyRaster = await page.evaluate(async () => {
+		const v = window.__h.reader, renderer = v.renderer;
+		const slot = await renderer.createPlaceholder(10, 1, document);
+		document.body.appendChild(slot.wrapper);
+		const original = renderer.getPageLinks.bind(renderer);
+		let reached, resume;
+		const entered = new Promise(resolve => { reached = resolve; });
+		const gate = new Promise(resolve => { resume = resolve; });
+		renderer.getPageLinks = async (...args) => { reached(); await gate; return original(...args); };
+		let finished = false;
+		const pending = renderer.renderPage(10, 1, undefined, document, undefined, slot).then(rendered => { finished = true; return rendered; });
+		try {
+			await entered;
+			const canvas = slot.wrapper.querySelector("canvas");
+			const shown = !!canvas && canvas.isConnected && canvas.width > 0 && !finished;
+			resume(); renderer.releasePage(await pending);
+			return shown;
+		} finally { resume(); renderer.getPageLinks = original; slot.wrapper.remove(); }
+	});
+	check("页面画面无需等待文本与链接全部完成", earlyRaster);
+	const popupFlow = await page.evaluate(async () => {
+		await window.__h.openReader();
+		const v = window.__h.reader;
+		const wait = async (ready) => {
+			for (let i = 0; i < 100; i++) { if (ready()) return; await new Promise(r => setTimeout(r, 10)); }
+			throw new Error("Selection flow timed out");
+		};
+		const select = () => {
+			const spans = v.pages[0].wrapper.querySelectorAll(".textLayer span");
+			const range = document.createRange();
+			range.setStart(spans[0].firstChild, 0);
+			range.setEnd(spans[2].firstChild, spans[2].textContent.length);
+			const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+			v.refreshSelectionState(); return v.currentPayload;
+		};
+		let requests = 0;
+		v.popup.deps.translate = async () => { requests++; return "测试译文"; };
+		const payload = select(); v.popup.show(payload);
+		let el = document.querySelector(".pr-popup");
+		const compact = !el.querySelector("textarea") && getComputedStyle(el.querySelector(".pr-popup-translate")).display === "none" && el.getBoundingClientRect().height < 160;
+		el.querySelector('[aria-label="直线"]').click();
+		const before = v.data.annotations.length;
+		const styleOnly = v.data.annotations.length === before && v.popupStyle === "underline";
+		el.querySelector(".pr-popup-translate-btn").click();
+		await wait(() => !v.popup.translating);
+		const expanded = el.querySelector(".pr-popup-result").textContent === "测试译文" && getComputedStyle(el.querySelector(".pr-popup-result-actions")).display !== "none";
+		v.popup.show(payload); el = document.querySelector(".pr-popup");
+		const cachedCollapsed = getComputedStyle(el.querySelector(".pr-popup-translate")).display === "none";
+		el.querySelector(".pr-popup-translate-btn").click();
+		const cachedOnce = requests === 1 && el.querySelector(".pr-popup-result").textContent === "测试译文";
+		el.querySelector('[aria-label="添加批注"]').click();
+		await wait(() => !!document.querySelector(".pr-popup textarea"));
+		const ann = v.data.annotations.at(-1), id = ann.id;
+		const currentStyle = ann.style === "underline" && v.data.annotations.length === before + 1;
+		const input = document.querySelector(".pr-popup textarea"); input.value = "第一行\n第二行";
+		document.querySelector('[aria-label="保存批注"]').click();
+		await wait(() => !v.popup.isVisible);
+		const sameAnnotation = v.data.annotations.length === before + 1 && v.data.annotations.find(a => a.id === id).note === "第一行\n第二行";
+		v.openHighlightMenu(v.data.annotations.find(a => a.id === id), 100, 100);
+		const reopen = document.querySelector(".pr-popup textarea").value === "第一行\n第二行";
+		v.clearSelection(); v.setTextTool("underline");
+		const pressed = [...v.selectionActions.el.querySelectorAll("button")].some(b => b.textContent === "下划线" && b.getAttribute("aria-pressed") === "true");
+		select(); v.popupStyle = "highlight"; v.onMouseUp(); v.onMouseUp();
+		await wait(() => !v.savingHighlight && !v.currentPayload);
+		const autoSave = v.data.annotations.length === before + 2 && v.data.annotations.at(-1).style === "underline" && !v.popup.isVisible;
+		v.setTextTool(null); select(); v.onMouseUp(); await wait(() => v.popup.isVisible);
+		const selectMode = v.data.annotations.length === before + 2 && !document.querySelector(".pr-popup textarea");
+		v.clearSelection();
+		return { compact, styleOnly, expanded, cachedCollapsed, cachedOnce, currentStyle, sameAnnotation, reopen, pressed, autoSave, selectMode };
+	});
+	for (const [name, passed] of Object.entries(popupFlow)) check(`选区与批注流程 ${name}`, passed, JSON.stringify(popupFlow));
+	await require("./readerControls.cjs")(page, check);
+	const hiddenPosition = await page.evaluate(async () => {
+		const v = window.__h.reader;
+		const find = v.app.vault.getAbstractFileByPath;
+		v.app.vault.getAbstractFileByPath = path => path === v.file.path ? v.file : find(path);
+		await v.scrollToPage(1); v.schedulePositionSave();
+		const expected = v.lastReadingPosition.page;
+		v.contentEl.style.display = "none"; await v.savePositionNow();
+		const saved = v.plugin.settings.readingPositions[v.file.path].page;
+		v.contentEl.style.display = "";
+		v.app.vault.getAbstractFileByPath = find;
+		return { expected, saved };
+	});
+	check("关闭或隐藏视图不覆盖阅读位置", hiddenPosition.expected === 1 && hiddenPosition.saved === 1, JSON.stringify(hiddenPosition));
+	const streaming = await page.evaluate(() => window.__h.streamingReaderChecks());
+	for (const [name, passed] of Object.entries(streaming)) check(`真实流式选区翻译 ${name}`, passed, JSON.stringify(streaming));
+	await page.evaluate(() => window.__h.openReader("/large.pdf"));
 	await page.evaluate(async () => {
 		const v = window.__h.reader;
 		const pending = v.scrollToPage(299);
@@ -348,6 +557,17 @@ function check(label, cond, detail = "") {
 	});
 	const closed = await page.evaluate(async () => { const v = window.__h.reader; await window.__h.closeReader(); return { pages: v.pages.length, task: !!v.pageRender, children: v.children.length }; });
 	check("关闭释放页面与组件", closed.pages === 0 && !closed.task && closed.children === 0, JSON.stringify(closed));
+	const english = await browser.newPage();
+	await english.addInitScript(() => { globalThis.__testLanguage = "en"; });
+	await english.goto(process.env.PR_TEST_URL);
+	await english.waitForFunction(() => !!window.__h);
+	await english.evaluate(() => window.__h.openReader());
+	const englishUi = await english.evaluate(() => {
+		const labels = [...window.__h.reader.headerEl.querySelectorAll("button")].map(b => b.getAttribute("aria-label") || b.textContent);
+		return { zoom: labels.includes("Zoom out"), select: labels.includes("Select text"), comment: labels.includes("Comment"), chinese: labels.some(label => /[\u3400-\u9fff]/.test(label || "")) };
+	});
+	check("英文界面使用宿主语言", englishUi.zoom && englishUi.select && englishUi.comment && !englishUi.chinese, JSON.stringify(englishUi));
+	await english.close();
 	await browser.close();
 	if (failures > 0) {
 		console.log(`\nACCEPTANCE FAILED (${failures} failures)`);

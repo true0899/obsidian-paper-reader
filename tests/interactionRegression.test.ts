@@ -1,3 +1,5 @@
+import { t } from "../src/i18n";
+import * as hostInternals from "../src/obsidian-internals";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -18,7 +20,8 @@ function load(path: string, imports: Record<string, unknown> = {}): any {
 		compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 	}).outputText;
 	runInNewContext(source, {
-		exports, require: (name: string) => imports[name] ?? obsidian,
+		AbortController,
+		exports, require: (name: string) => imports[name] ?? (name.endsWith("/i18n") ? { t } : name.endsWith("/obsidian-internals") ? hostInternals : obsidian),
 		document: { body: element(), createElement: element }, window: { innerWidth: 1000, innerHeight: 1000 },
 		createDiv: element, createEl: element, createSpan: element, createSvg: element,
 		DOMRect: class {}, crypto,
@@ -46,16 +49,17 @@ test("real popup: old completion cannot overwrite new translation or cache", asy
 		"../settings": { COLOR_KEYS: ["yellow"] },
 		"../pdfview/popupCache": { popupCacheKey: (p: typeof A) => p.text },
 	});
-	const a = deferred(), b = deferred(), cache = new Map();
+	const a = deferred(), b = deferred(), cache = new Map(), signals: AbortSignal[] = [];
 	const popup = new SelectionPopup({
 		getColors: () => ({}), getStyle: () => "highlight", getCached: (k: string) => cache.get(k),
 		setCached: (k: string, v: unknown) => cache.set(k, v),
-		translate: (p: typeof A) => p.text === "A" ? a.promise : b.promise,
+		translate: (p: typeof A, _chunk: unknown, signal: AbortSignal) => { signals.push(signal); return p.text === "A" ? a.promise : b.promise; },
 	});
 	popup.show(A);
 	assert.equal(popup.payloadSnapshot, A);
 	const first = popup.runTranslate();
 	popup.show(B);
+	assert.equal(signals[0].aborted, true);
 	const second = popup.runTranslate();
 	a.resolve("translation A"); await first;
 	assert.equal(popup.translating, true);
@@ -68,17 +72,18 @@ test("real popup: old completion cannot overwrite new translation or cache", asy
 test("real panel: switching selection or closing invalidates the pending answer", async () => {
 	const { AnswerPanel } = load("src/panel/AnswerPanel.ts");
 	const a = deferred(), b = deferred();
-	const recorded: unknown[] = [];
+	const recorded: unknown[] = [], signals: AbortSignal[] = [];
 	const panel = Object.create(AnswerPanel.prototype);
 	Object.assign(panel, {
 		component: { addChild: (c: any) => c, removeChild() {} },
 		generation: 0, streaming: false, history: [], bodyEl: element(), titleEl: element(), el: element(),
 		mode: "translate", payload: A, getSourcePath: () => "",
 		callbacks: { onAnswered: (...args: unknown[]) => recorded.push(args) },
-		llm: { async *streamChat(messages: string[]) { yield await (messages[0] === "A" ? a.promise : b.promise); } },
+		llm: { async *streamChat(messages: string[], signal: AbortSignal) { signals.push(signal); yield await (messages[0] === "A" ? a.promise : b.promise); } },
 	});
 	const first = panel.run(["A"]);
 	panel.start("translate", B, "");
+	assert.equal(signals[0].aborted, true);
 	const second = panel.run(["B"]);
 	a.resolve("answer A"); await first;
 	assert.equal(panel.streaming, true);
@@ -86,7 +91,7 @@ test("real panel: switching selection or closing invalidates the pending answer"
 	b.resolve("answer B"); await second;
 	assert.deepEqual(recorded[0], ["translate", B, "answer B"]);
 	const pending = panel.run(["B"]);
-	panel.close(); await pending;
+	panel.close(); assert.equal(signals[signals.length - 1].aborted, true); await pending;
 	assert.equal(recorded.length, 1);
 	assert.equal(panel.lastAnswer, "");
 });
@@ -122,7 +127,9 @@ test("real submitNote: failed add/edit keeps draft, emits no success, retry save
 });
 
 test("note deletion preserves draft on save failure and records undo after success", async () => {
- const { PaperReaderView } = load("src/pdfview/PaperReaderView.ts");
+ const { PaperReaderView } = load("src/pdfview/PaperReaderView.ts", {
+  "../history/AnnotationHistory": { cloneAnnotation: (a: unknown) => structuredClone(a) },
+ });
  const note = { id: "note", type: "note", note: "keep me" };
  const other = { id: "highlight" };
  let saved = false, hidden = false;
@@ -141,26 +148,27 @@ test("note deletion preserves draft on save failure and records undo after succe
  assert.deepEqual(view.data.annotations, [other]);
  assert.equal(hidden, true); assert.equal(view.editingNoteId, null);
  assert.equal(history[0].kind, "remove");
- assert.equal(history[0].anns[0], note); assert.equal(history[0].indexes[0], 0);
+ assert.deepEqual(history[0].anns[0], note); assert.equal(history[0].indexes[0], 0);
 });
 
-test("header note action opens the note editor for the current selection", () => {
+test("header note action saves an annotation before opening its comment editor", async () => {
 	const { PaperReaderView } = load("src/pdfview/PaperReaderView.ts");
 	let shown: unknown = null, focused = false, menuHidden = false;
 	const view = Object.create(PaperReaderView.prototype);
 	Object.assign(view, {
 		currentPayload: A, editingNoteId: "old",
+		commitHighlight: async () => ({ id: "new", style: "underline" }),
 		hlMenu: { hide: () => { menuHidden = true; } },
 		popup: {
-			show: (payload: unknown) => { shown = payload; },
+			showEdit: (annotation: unknown) => { shown = annotation; },
 			focusNote: () => { focused = true; },
 		},
 	});
-	view.openNotePopup();
-	assert.equal(shown, A);
+	await view.openNotePopup();
+	assert.deepEqual(shown, { id: "new", style: "underline" });
 	assert.equal(focused, true);
 	assert.equal(menuHidden, true);
-	assert.equal(view.editingNoteId, null);
+	assert.equal(view.editingNoteId, "new");
 });
 
 test("answer renders Markdown before stream completion and flushes the last chunk", async () => {

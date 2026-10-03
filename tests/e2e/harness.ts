@@ -30,9 +30,10 @@ function decorate(): void {
 		this.appendChild(d);
 		return d;
 	};
-	proto.createSpan = function (o?: { cls?: string }) {
+	proto.createSpan = function (o?: { cls?: string; text?: string }) {
 		const d = document.createElement("span");
 		if (o?.cls) d.className = o.cls;
+		if (o?.text) d.textContent = o.text;
 		this.appendChild(d);
 		return d;
 	};
@@ -226,6 +227,29 @@ class Harness {
 			fillVisible: getComputedStyle(layer.firstElementChild!).backgroundColor !== "rgba(0, 0, 0, 0)",
 			text: selection.toString(),
 		};
+	}
+
+	splitWordHighlights(): { gap: number; radius: string; noteRadius: string; separateAnnotations: boolean } {
+		const annotations = [[0, 5], [5, 14]].map(([from, to]) =>
+			annotationFromPayload(this.selectText("LandslideAgent", from, to), { type: "highlight", color: "yellow", style: "highlight" }));
+		renderHighlightRects(this.highlightLayer!, annotations, SCALE, { yellow: "#F5C542" }, () => {});
+		const elements = Array.from(this.highlightLayer!.querySelectorAll<HTMLElement>(".pr-highlight-rect"));
+		const [left, right] = elements.map(el => el.getBoundingClientRect());
+		// Simulate a stale stylesheet/theme rule while the new renderer is loaded.
+		const staleStyle = document.createElement("style");
+		staleStyle.textContent = ".pr-highlight-rect, .pr-note-rect { border-radius: 1px; }";
+		document.head.appendChild(staleStyle);
+		const note = annotationFromPayload(this.selectText("LandslideAgent", 0, 5), { type: "note", color: "yellow", note: "test" });
+		const noteLayer = document.createElement("div");
+		this.pageEl!.appendChild(noteLayer);
+		renderHighlightRects(noteLayer, [note], SCALE, { yellow: "#F5C542" }, () => {});
+		const result = { gap: right.left - left.right, radius: getComputedStyle(elements[0]).borderRadius,
+			noteRadius: getComputedStyle(noteLayer.querySelector(".pr-note-rect")!).borderRadius,
+			separateAnnotations: elements[0].dataset.annotationId !== elements[1].dataset.annotationId };
+		noteLayer.remove(); staleStyle.remove();
+		window.getSelection()?.removeAllRanges();
+		this.redraw();
+		return result;
 	}
 
 	clearSelectionPreview(): void {
@@ -461,6 +485,35 @@ class Harness {
 			paths: document.querySelectorAll(".pr-ink-path").length,
 			anns: this.data.annotations.filter((a) => a.type === "ink").length,
 		};
+	}
+
+	async streamingReaderChecks(): Promise<Record<string, boolean>> {
+		const v = this.reader, settings = v.plugin.settings;
+		const prior = { llmBaseUrl: settings.llmBaseUrl, llmApiKey: settings.llmApiKey, llmModel: settings.llmModel };
+		Object.assign(settings, { llmBaseUrl: "https://mock.local/v1", llmApiKey: "test-only", llmModel: "mock" });
+		const oldFetch = window.fetch;
+		let controller: ReadableStreamDefaultController<Uint8Array>, signal: AbortSignal | null = null;
+		const encode = new TextEncoder();
+		window.fetch = async (_url, options) => {
+			signal = options?.signal as AbortSignal;
+			const body = new ReadableStream<Uint8Array>({ start(c) {
+				controller = c;
+				c.enqueue(encode.encode('data: {"choices":[{"delta":{"content":"逐段显示"}}]}\n\n'));
+				signal!.addEventListener("abort", () => { try { c.error(new DOMException("Aborted", "AbortError")); } catch {} }, { once: true });
+			} });
+			return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+		};
+		try {
+			const span = v.pages[0].wrapper.querySelector(".textLayer span"), range = document.createRange();
+			range.selectNodeContents(span); const selection = window.getSelection()!; selection.removeAllRanges(); selection.addRange(range);
+			v.refreshSelectionState(); v.popup.show(v.currentPayload);
+			const count = v.data.annotations.length;
+			const pending = v.popup.runTranslate();
+			for (let i = 0; i < 100 && document.querySelector(".pr-popup-result")?.textContent !== "逐段显示"; i++) await new Promise(r => setTimeout(r, 10));
+			const incremental = v.popup.translating && document.querySelector(".pr-popup-result")?.textContent === "逐段显示";
+			v.popup.hide(); await pending;
+			return { incremental, abortOnHide: !!signal?.aborted, noCancelledAnnotation: v.data.annotations.length === count };
+		} finally { window.fetch = oldFetch; Object.assign(settings, prior); v.clearSelection(); }
 	}
 
 	async searchAll(query: string): Promise<{ total: number; firstPage: number }> {

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { loadTs, notices } from "./vmLoad";
+import * as readingPositions from "../src/pdfview/readingPositions";
 
 // ---- helpers ----
 
@@ -41,6 +42,7 @@ class PluginStub {
 
 function makePlugin(files: FakeTFile[]) {
 	const { default: PluginClass } = loadTs("src/main.ts", {
+		"./pdfview/readingPositions": readingPositions,
 		"./pdfview/worker": { configureBundledPdfWorker: () => () => {} },
 		"./pdfview/PdfRenderer": { configurePdfWorker: () => {} },
 		"./pdfview/PaperReaderView": {
@@ -130,6 +132,46 @@ test("rename migrates the reading position record", async () => {
 	// unknown old path: no-op
 	await plugin.migrateReadingPosition("nope.pdf", "x.pdf");
 	assert.deepEqual(Object.keys(plugin.settings.readingPositions), ["new/a.pdf"]);
+});
+
+test("settings load copies positions and save retains the newest 200", async () => {
+	const plugin = makePlugin([]);
+	const persisted = { "saved.pdf": { page: 2, pageFraction: 0.5, updatedAt: 1 } };
+	plugin.loadData = async () => ({ readingPositions: persisted });
+	await plugin.loadSettings();
+	plugin.settings.readingPositions["saved.pdf"].page = 8;
+	assert.equal(persisted["saved.pdf"].page, 2);
+	for (let i = 0; i < 220; i++) {
+		plugin.settings.readingPositions[`${i}.pdf`] = { page: 1, pageFraction: 0, updatedAt: i + 2 };
+	}
+	let saved: any;
+	plugin.saveData = async (settings: any) => { saved = settings; };
+	await plugin.saveSettings();
+	assert.equal(Object.keys(saved.readingPositions).length, 200);
+	assert.equal(saved.readingPositions["19.pdf"], undefined);
+	assert.equal(saved.readingPositions["219.pdf"].updatedAt, 221);
+});
+
+test("vault deletion clears file and folder records and persists only when changed", async () => {
+	const plugin = makePlugin([]);
+	let deleteHandler: ((file: { path: string }) => void) | undefined;
+	plugin.app.vault.on = (event: string, handler: typeof deleteHandler) => {
+		if (event === "delete") deleteHandler = handler;
+		return {};
+	};
+	await plugin.onload();
+	plugin.settings.readingPositions = {
+		"papers/a.pdf": { page: 1 }, "papers/sub/b.pdf": { page: 2 }, "papers2/c.pdf": { page: 3 },
+	};
+	let saves = 0;
+	plugin.saveSettings = async () => { saves++; };
+	deleteHandler!({ path: "papers" });
+	assert.deepEqual(Object.keys(plugin.settings.readingPositions), ["papers2/c.pdf"]);
+	assert.equal(saves, 1);
+	deleteHandler!({ path: "missing.pdf" });
+	assert.equal(saves, 1);
+	deleteHandler!({ path: "papers2/c.pdf" });
+	assert.equal(saves, 2);
 });
 
 // ---- 缺陷 2: single-page restore ----
