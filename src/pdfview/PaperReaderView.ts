@@ -706,6 +706,7 @@ export class PaperReaderView extends ItemView {
 		mkBtn("chevron-down", t("下一个 (Enter)"), () => void this.gotoHit(1));
 		mkBtn("x", t("关闭 (Esc)"), () => this.closeSearch());
 		this.searchInputEl.addEventListener("input", () => {
+			this.searchToken++;
 			if (this.searchDebounce !== null) window.clearTimeout(this.searchDebounce);
 			this.searchDebounce = window.setTimeout(() => void this.runSearch(), 250);
 		});

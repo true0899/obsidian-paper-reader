@@ -37,6 +37,24 @@ export function normalizeQuery(query: string): string {
 	return normalizeWithMap(query.trim()).norm;
 }
 
+/** Match a cached page index without normalizing the page again for every query. */
+export function findPageHits(
+	{ norm, map, ends }: ReturnType<typeof normalizeWithMap>, q: string, page: number
+): SearchHit[] {
+	if (!q) return [];
+	const hits: SearchHit[] = [];
+	let from = 0;
+	for (;;) {
+		const idx = norm.indexOf(q, from);
+		if (idx < 0) break;
+		const origStart = map[idx];
+		const origEnd = ends[idx + q.length - 1];
+		hits.push({ page, index: origStart, length: origEnd - origStart });
+		from = idx + 1;
+	}
+	return hits;
+}
+
 /**
  * Find all hits of query inside each page's extracted text.
  * pageTexts[i] corresponds to page i + 1; undefined entries are skipped.
@@ -51,16 +69,7 @@ export function findHits(
 	for (let p = 0; p < pageTexts.length; p++) {
 		const text = pageTexts[p];
 		if (!text) continue;
-		const { norm, map, ends } = normalizeWithMap(text);
-		let from = 0;
-		for (;;) {
-			const idx = norm.indexOf(q, from);
-			if (idx < 0) break;
-			const origStart = map[idx];
-			const origEnd = ends[idx + q.length - 1] ?? text.length;
-			hits.push({ page: p + 1, index: origStart, length: origEnd - origStart });
-			from = idx + 1;
-		}
+		for (const hit of findPageHits(normalizeWithMap(text), q, p + 1)) hits.push(hit);
 	}
 	return hits;
 }

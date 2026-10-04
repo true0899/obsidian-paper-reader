@@ -1,6 +1,6 @@
 import { t } from "../i18n";
-import { findHits, type SearchHit } from "./searchText";
-import { mergeTextRects, textRangeRects } from "../pdfview/selection";
+import { findPageHits, normalizeQuery, normalizeWithMap, type SearchHit } from "./searchText";
+import { pageSearchGeometry } from "./searchGeometry";
 import type { PdfRenderer, RenderedPage } from "../pdfview/PdfRenderer";
 import type { HighlightRect } from "../storage/annotationStore";
 
@@ -26,6 +26,8 @@ interface SearchDependencies {
 /** Document search scanning and hit navigation. A token invalidates outstanding
  * extraction/navigation when the view closes or changes documents. */
 export class SearchController {
+	private indexedPages = new Map<number, { text: string; index: ReturnType<typeof normalizeWithMap> }>();
+	private geometry = new WeakMap<HTMLElement, { token: number; textLayer: Element | null; scale: number; hits: Map<SearchHit, HighlightRect[]> }>();
 	constructor(private state: SearchState, private deps: SearchDependencies) {}
 	async run(): Promise<void> {
 		const token = ++this.state.token;
@@ -40,6 +42,9 @@ export class SearchController {
 		}
 		if (countEl) countEl.setText(t("搜索中…"));
 		const n = this.deps.renderer.numPages;
+		for (const page of this.indexedPages.keys()) if (page > n) this.indexedPages.delete(page);
+		const normalizedQuery = normalizeQuery(query);
+		let checkpoint = performance.now();
 		let hasText = false;
 		for (let p = 1; p <= n; p++) {
 			if (token !== this.state.token) return;
@@ -47,11 +52,21 @@ export class SearchController {
 			try { text = await this.deps.renderer.getPageTextEnsured(p); } catch { /* Skip an unreadable page, retain other hits. */ }
 			if (token !== this.state.token) return;
 			hasText ||= !!text.trim();
-			const hits = findHits([text], query).map(hit => ({ ...hit, page: p }));
-			this.state.hits.push(...hits);
+			let cached = this.indexedPages.get(p);
+			if (!cached || cached.text !== text) {
+				cached = { text, index: normalizeWithMap(text) };
+				this.indexedPages.set(p, cached);
+			}
+			const hits = findPageHits(cached.index, normalizedQuery, p);
+			for (const hit of hits) this.state.hits.push(hit);
 			if (this.state.current < 0 && this.state.hits.length) await this.goto(1, true);
 			if (token !== this.state.token) return;
 			if (countEl) countEl.setText(`${this.state.current >= 0 ? this.state.current + 1 : 0} / ${this.state.hits.length} · ${p}/${n}`);
+			if (performance.now() - checkpoint >= 4) {
+				await new Promise<void>(resolve => setTimeout(resolve, 0));
+				if (token !== this.state.token) return;
+				checkpoint = performance.now();
+			}
 		}
 		if (countEl) countEl.setText(this.state.hits.length ? `${this.state.current + 1} / ${this.state.hits.length}` : hasText ? t("无结果") : t("无法提取文本（可能是扫描件）"));
 	}
@@ -84,21 +99,27 @@ export class SearchController {
 		if (!page) return;
 		const layer = page.highlightLayer;
 		const hitsOnPage = this.state.hits.filter((h) => h.page === current.page);
+		const textLayer = page.wrapper.querySelector(".textLayer"), scale = this.deps.scale();
+		let cached = this.geometry.get(page.wrapper);
+		if (!cached || cached.token !== this.state.token || cached.textLayer !== textLayer || cached.scale !== scale) {
+			const rectsForHit = pageSearchGeometry(page.wrapper);
+			cached = { token: this.state.token, textLayer, scale, hits: new Map() };
+			for (const hit of hitsOnPage) cached.hits.set(hit, rectsForHit(hit.index, hit.length));
+			this.geometry.set(page.wrapper, cached);
+		}
+		const fragment = page.wrapper.ownerDocument.createDocumentFragment();
 		for (const hit of hitsOnPage) {
-			const range = this.deps.domRangeForText(page.wrapper, hit.index, hit.length);
-			if (!range) continue;
-			const pageRect = page.wrapper.getBoundingClientRect();
-			for (const r of mergeTextRects(textRangeRects(range, page.wrapper))) {
-				if (r.width < 2 || r.height < 2) continue;
-				const el = layer.createDiv({
-					cls: hit === current ? "pr-search-hit pr-search-current" : "pr-search-hit",
-				});
-				el.style.left = `${r.left - pageRect.left}px`;
-				el.style.top = `${r.top - pageRect.top}px`;
+			for (const r of cached.hits.get(hit) ?? []) {
+				const el = page.wrapper.ownerDocument.createElement("div");
+				el.className = hit === current ? "pr-search-hit pr-search-current" : "pr-search-hit";
+				el.style.left = `${r.x}px`;
+				el.style.top = `${r.y}px`;
 				el.style.width = `${r.width}px`;
 				el.style.height = `${r.height}px`;
+				fragment.appendChild(el);
 			}
 		}
+		layer.appendChild(fragment);
 	}
 
 }

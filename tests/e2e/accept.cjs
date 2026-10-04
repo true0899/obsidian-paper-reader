@@ -413,6 +413,29 @@ function check(label, cond, detail = "") {
 		return { hits: v.searchHits.length, page: v.currentPage, marks: v.pagesEl.querySelectorAll(".pr-search-current").length };
 	});
 	check("窗口化后全文搜索能定位未读末页", windowSearch.hits === 1 && windowSearch.page === 30 && windowSearch.marks > 0, JSON.stringify(windowSearch));
+	const singleLetterSearch = await page.evaluate(async () => {
+		const v = window.__h.reader;
+		let ticks = 0;
+		const timer = setInterval(() => ticks++, 0);
+		const start = performance.now();
+		try {
+			v.searchInputEl.value = "E"; await v.runSearch();
+			let expected = 0;
+			for (let p = 1; p <= v.renderer.numPages; p++) expected += ((await v.renderer.getPageTextEnsured(p)).match(/e/gi) || []).length;
+			const page = v.pages.find(p => p.pageNumber === v.searchHits[v.currentHit].page);
+			const marks = page.highlightLayer.querySelectorAll(".pr-search-hit").length;
+			let scans = 0;
+			const original = page.wrapper.querySelectorAll;
+			page.wrapper.querySelectorAll = function (...args) { scans++; return original.apply(this, args); };
+			try { await v.gotoHit(1); }
+			finally { page.wrapper.querySelectorAll = original; }
+			return { hits: v.searchHits.length, expected, ticks, marks, scans, current: v.currentHit, elapsed: Math.round(performance.now() - start) };
+		} finally { clearInterval(timer); }
+	});
+	console.log("  单字搜索数据", JSON.stringify(singleLetterSearch));
+	check("单字 E 保留全部命中，搜索期间界面可处理事件", singleLetterSearch.hits === singleLetterSearch.expected && singleLetterSearch.hits > 5000 && singleLetterSearch.ticks > 0 && singleLetterSearch.marks > 100, JSON.stringify(singleLetterSearch));
+	check("同页切换命中复用坐标，不逐项扫描文字 DOM", singleLetterSearch.current === 1 && singleLetterSearch.scans <= 2, JSON.stringify(singleLetterSearch));
+	await page.evaluate(() => window.__h.reader.closeSearch());
 	const redraw = await page.evaluate(async () => {
 		const v = window.__h.reader;
 		const ann = { id: "window-note", type: "note", page: 30, rects: [{ x: 30, y: 220, width: 100, height: 12 }], text: "Synthetic", color: "yellow", note: "retained", createdAt: "", textOffset: 0, contextBefore: "", contextAfter: "" };
