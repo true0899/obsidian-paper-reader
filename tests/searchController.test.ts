@@ -31,3 +31,14 @@ test("document cancellation discards extraction before publishing hits", async (
 	ctx.state.token++; finish("needle"); await pending;
 	assert.equal(ctx.state.hits.length, 0); assert.equal(ctx.navigated.length, 0);
 });
+
+test("changing documents does not reuse the previous page's search index", async () => {
+	let text = "needle";
+	const ctx = setup(async () => text);
+	await ctx.controller.run();
+	assert.equal(ctx.state.hits.length, 3);
+	text = "another document";
+	await ctx.controller.run();
+	assert.equal(ctx.state.hits.length, 0);
+	assert.equal(ctx.messages.at(-1), "无结果");
+});

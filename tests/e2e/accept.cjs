@@ -272,13 +272,13 @@ function check(label, cond, detail = "") {
 		const rect = el => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, middle: (r.left + r.right) / 2 }; };
 		return { left: rect(v.headerEl.querySelector(".pr-header-start")), center: rect(v.headerEl.querySelector(".pr-header-center")), right: rect(v.headerEl.querySelector(".pr-header-end")), header: rect(v.headerEl), label: v.pageInputEl.value, count: v.pageTotalEl.textContent };
 	});
-	check("工具栏采用左导航、中间批注、右操作布局", toolbar.left.right < toolbar.center.left && toolbar.center.right < toolbar.right.left && Math.abs(toolbar.center.middle - toolbar.header.middle) < 2 && toolbar.label === "i" && toolbar.count === "1 / 30", JSON.stringify(toolbar));
+	check("工具栏采用左导航、中间批注、右操作布局", toolbar.left.right < toolbar.center.left && toolbar.center.right < toolbar.right.left && Math.abs(toolbar.center.middle - toolbar.header.middle) < 2 && toolbar.label === "i" && toolbar.count === "(1 / 30)", JSON.stringify(toolbar));
 	await page.getByRole("button", { name: "下一页", exact: true }).click();
 	await page.waitForFunction(() => window.__h.reader.currentPage === 2);
 	await page.getByRole("textbox", { name: "页码", exact: true }).fill("iii");
 	await page.getByRole("textbox", { name: "页码", exact: true }).press("Enter");
 	await page.waitForFunction(() => window.__h.reader.currentPage === 3);
-	check("页码框按 PDF 标签跳转并显示实际页数", await page.evaluate(() => window.__h.reader.pageInputEl.value === "iii" && window.__h.reader.pageTotalEl.textContent === "3 / 30"));
+	check("页码框按 PDF 标签跳转并显示实际页数", await page.evaluate(() => window.__h.reader.pageInputEl.value === "iii" && window.__h.reader.pageTotalEl.textContent === "(3 / 30)"));
 	await page.getByRole("textbox", { name: "页码", exact: true }).fill("1");
 	await page.getByRole("textbox", { name: "页码", exact: true }).press("Enter");
 	await page.waitForFunction(() => window.__h.reader.currentPage === 1);
@@ -413,6 +413,29 @@ function check(label, cond, detail = "") {
 		return { hits: v.searchHits.length, page: v.currentPage, marks: v.pagesEl.querySelectorAll(".pr-search-current").length };
 	});
 	check("窗口化后全文搜索能定位未读末页", windowSearch.hits === 1 && windowSearch.page === 30 && windowSearch.marks > 0, JSON.stringify(windowSearch));
+	const singleLetterSearch = await page.evaluate(async () => {
+		const v = window.__h.reader;
+		let ticks = 0;
+		const timer = setInterval(() => ticks++, 0);
+		const start = performance.now();
+		try {
+			v.searchInputEl.value = "E"; await v.runSearch();
+			let expected = 0;
+			for (let p = 1; p <= v.renderer.numPages; p++) expected += ((await v.renderer.getPageTextEnsured(p)).match(/e/gi) || []).length;
+			const page = v.pages.find(p => p.pageNumber === v.searchHits[v.currentHit].page);
+			const marks = page.highlightLayer.querySelectorAll(".pr-search-hit").length;
+			let scans = 0;
+			const original = page.wrapper.querySelectorAll;
+			page.wrapper.querySelectorAll = function (...args) { scans++; return original.apply(this, args); };
+			try { await v.gotoHit(1); }
+			finally { page.wrapper.querySelectorAll = original; }
+			return { hits: v.searchHits.length, expected, ticks, marks, scans, current: v.currentHit, elapsed: Math.round(performance.now() - start) };
+		} finally { clearInterval(timer); }
+	});
+	console.log("  单字搜索数据", JSON.stringify(singleLetterSearch));
+	check("单字 E 保留全部命中，搜索期间界面可处理事件", singleLetterSearch.hits === singleLetterSearch.expected && singleLetterSearch.hits > 5000 && singleLetterSearch.ticks > 0 && singleLetterSearch.marks > 100, JSON.stringify(singleLetterSearch));
+	check("同页切换命中复用坐标，不逐项扫描文字 DOM", singleLetterSearch.current === 1 && singleLetterSearch.scans <= 2, JSON.stringify(singleLetterSearch));
+	await page.evaluate(() => window.__h.reader.closeSearch());
 	const redraw = await page.evaluate(async () => {
 		const v = window.__h.reader;
 		const ann = { id: "window-note", type: "note", page: 30, rects: [{ x: 30, y: 220, width: 100, height: 12 }], text: "Synthetic", color: "yellow", note: "retained", createdAt: "", textOffset: 0, contextBefore: "", contextAfter: "" };

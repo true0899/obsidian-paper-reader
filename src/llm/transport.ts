@@ -9,10 +9,10 @@ export type ChatTransport = (url: string, body: string, headers: Record<string, 
 
 // Load typed Node modules only when the desktop transport is actually used.
 export const desktopTransport: ChatTransport = async (url, body, headers, signal) => {
-	const [http, zlib] = await Promise.all([
-		new URL(url).protocol === "https:" ? import("node:https") : import("node:http"),
-		import("node:zlib"),
-	]);
+	// Obsidian exposes CommonJS require; Chromium cannot resolve node: dynamic imports.
+	const http: typeof import("node:http") = new URL(url).protocol === "https:"
+		? require("node:https") : require("node:http");
+	const zlib: typeof import("node:zlib") = require("node:zlib");
 	return new Promise((resolve, reject) => {
 		const request = http.request(url, { method: "POST", headers: { ...headers, "Accept-Encoding": "identity" }, signal }, response => {
 			const encoding = response.headers["content-encoding"];

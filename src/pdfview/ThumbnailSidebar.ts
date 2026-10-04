@@ -1,7 +1,8 @@
 import { t } from "../i18n";
+import { setIcon } from "obsidian";
 import type { PdfRenderer } from "./PdfRenderer";
 import { OutlineNode, OutlineTree } from "../outline/OutlineTree";
-import { AnnotationList, AnnotationListCallbacks } from "./AnnotationList";
+import { AnnotationList, AnnotationListCallbacks, AnnotationFilter } from "./AnnotationList";
 import type { Annotation } from "../storage/annotationStore";
 
 const THUMB_WIDTH = 140;
@@ -17,7 +18,16 @@ export interface ThumbnailSidebarOptions {
 	onSelect: (page: number) => void;
 	annotationList?: AnnotationListCallbacks;
 	getColors?: () => Record<string, string>;
+	/** sidebar tab clicked */
+	onModeChange?: (mode: SidebarMode) => void;
+	hasOutline?: () => boolean;
 }
+
+const MODE_TABS: { mode: SidebarMode; icon: string; label: string }[] = [
+	{ mode: "thumbs", icon: "image", label: t("缩略图") },
+	{ mode: "outline", icon: "list", label: t("目录") },
+	{ mode: "annotations", icon: "list-checks", label: t("标注") },
+];
 
 /**
  * Left sidebar with two modes: page thumbnails (lazy-rendered via
@@ -34,6 +44,9 @@ export class ThumbnailSidebar {
 	private observer: IntersectionObserver | null = null;
 	private outlineTree: OutlineTree | null = null;
 	private annList: AnnotationList | null = null;
+	// Survives list rebuilds after each annotation change.
+	private annFilter: AnnotationFilter = { query: "", colors: new Set(), type: "" };
+	private tabs = new Map<SidebarMode, HTMLButtonElement>();
 
 	private queue: number[] = [];
 	private queued = new Set<number>();
@@ -47,7 +60,24 @@ export class ThumbnailSidebar {
 		private options: ThumbnailSidebarOptions
 	) {
 		this.el = createDiv({ cls: "pr-sidebar" });
+		const tabBar = this.el.createDiv({ cls: "pr-sidebar-tabs", attr: { role: "tablist" } });
+		for (const { mode, icon, label } of MODE_TABS) {
+			const tab = tabBar.createEl("button", { cls: "pr-sidebar-tab clickable-icon", attr: { type: "button", role: "tab", "aria-label": label } });
+			setIcon(tab, icon);
+			tab.addEventListener("click", () => this.options.onModeChange?.(mode));
+			this.tabs.set(mode, tab);
+		}
 		this.listEl = this.el.createDiv({ cls: "pr-thumb-list" });
+	}
+
+	private syncTabs(): void {
+		const hasOutline = this.options.hasOutline?.() ?? true;
+		for (const [mode, tab] of this.tabs) {
+			const active = mode === this.mode;
+			tab.toggleClass("is-active", active);
+			tab.setAttr("aria-selected", String(active));
+			tab.disabled = mode === "outline" && !hasOutline;
+		}
 	}
 
 	getMode(): SidebarMode {
@@ -58,6 +88,7 @@ export class ThumbnailSidebar {
 		this.mode = "thumbs";
 		this.listEl.removeClass("pr-mode-outline");
 		this.reset();
+		this.syncTabs();
 		const gen = this.generation;
 		for (let p = 1; p <= numPages; p++) {
 			const item = this.listEl.createDiv({ cls: "pr-thumb" });
@@ -101,6 +132,7 @@ export class ThumbnailSidebar {
 		this.mode = "outline";
 		this.listEl.addClass("pr-mode-outline");
 		this.reset();
+		this.syncTabs();
 		this.outlineTree = new OutlineTree((page) => this.options.onSelect(page));
 		this.listEl.appendChild(this.outlineTree.el);
 		this.outlineTree.build(nodes);
@@ -111,11 +143,14 @@ export class ThumbnailSidebar {
 
 	showAnnotations(annotations: Annotation[]): void {
 		this.mode = "annotations";
+		this.listEl.removeClass("pr-mode-outline");
 		this.reset();
+		this.syncTabs();
 		if (!this.options.annotationList) return;
 		this.annList = new AnnotationList(
 			this.options.annotationList,
-			this.options.getColors ?? (() => ({}))
+			this.options.getColors ?? (() => ({})),
+			this.annFilter
 		);
 		this.listEl.appendChild(this.annList.el);
 		this.annList.build(annotations);
