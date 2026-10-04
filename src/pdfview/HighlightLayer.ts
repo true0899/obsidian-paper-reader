@@ -1,4 +1,5 @@
 import { setIcon } from "obsidian";
+import { t } from "../i18n";
 import type { Annotation, HighlightRect } from "../storage/annotationStore";
 import { highlightDisplayRects } from "./selection";
 
@@ -7,6 +8,8 @@ export type HighlightClickHandler = (
 	clientX: number,
 	clientY: number
 ) => void;
+
+const HIGHLIGHT_ALPHA = 0.55;
 
 const pageClickHandlers = new WeakMap<HTMLElement, EventListener>();
 
@@ -63,7 +66,8 @@ function styleRect(
 		el.style.backgroundSize = `100% ${thickness}px`;
 		el.addClass("pr-line-rect");
 	} else {
-		el.style.backgroundColor = hexToRgba(colorHex, 1);
+		// Partial alpha under multiply keeps saturated palette colors readable as paper highlights.
+		el.style.backgroundColor = hexToRgba(colorHex, HIGHLIGHT_ALPHA);
 		el.setCssStyles({ mixBlendMode: "multiply" });
 	}
 }
@@ -130,7 +134,7 @@ export function renderHighlightRects(
 		// note marker icon at the end of the last rect
 		if (ann.type === "note" && ann.rects.length > 0) {
 			const last = ann.rects[ann.rects.length - 1];
-			const icon = layerEl.createEl("button", { cls: "pr-note-icon", attr: { "aria-label": "编辑或删除批注", title: ann.note ?? "批注" } });
+			const icon = layerEl.createEl("button", { cls: "pr-note-icon", attr: { "aria-label": t("编辑或删除批注"), title: ann.note ?? t("批注") } });
 			setIcon(icon, "message-square");
 			icon.style.left = `${(last.x + last.width) * scale + 2}px`;
 			icon.style.top = `${last.y * scale - 2}px`;

@@ -23,7 +23,7 @@ export interface SelectionActionsCallbacks {
 	onAsk: () => void;
 }
 
-const COLOR_LABELS: Record<string, string> = {
+export const COLOR_LABELS: Record<string, string> = {
 	yellow: t("黄色"),
 	red: t("红色"),
 	green: t("绿色"),
@@ -50,6 +50,7 @@ export class SelectionActions {
 	readonly colorButton: HTMLButtonElement;
 	private buttons: HTMLButtonElement[] = [];
 	private colorSwatch: HTMLElement;
+	private opGroup: HTMLElement;
 	private modeButtons = new Map<AnnotationStyle | null, HTMLButtonElement>();
 
 	constructor(
@@ -101,6 +102,7 @@ export class SelectionActions {
 		setIcon(toggle, "ellipsis");
 		toggle.createSpan({ cls: "pr-sr-only", text: t("更多选区操作") });
 		const opGroup = this.secondaryEl.createDiv({ cls: "pr-actions-extra" });
+		this.opGroup = opGroup;
 		this.secondaryEl.addEventListener("toggle", () => {
 			if (!this.secondaryEl.open) return;
 			const rect = toggle.getBoundingClientRect();
@@ -146,12 +148,29 @@ export class SelectionActions {
 		return btn;
 	}
 
+	/** Prepend header controls that collapse into this menu when the view is narrow. */
+	addOverflowItems(items: { icon: string; label: string; cls: string; onClick: () => void }[]): HTMLButtonElement[] {
+		const first = this.opGroup.firstChild;
+		const buttons = items.map(({ icon, label, cls, onClick }) => {
+			const btn = createEl("button", { cls: `pr-header-btn clickable-icon ${cls}`, attr: { type: "button" } });
+			setIcon(btn, icon);
+			btn.createSpan({ text: label });
+			btn.addEventListener("mousedown", e => e.preventDefault());
+			btn.addEventListener("click", onClick);
+			this.opGroup.insertBefore(btn, first);
+			return btn;
+		});
+		this.opGroup.insertBefore(createDiv({ cls: "pr-menu-separator pr-only-compact" }), first);
+		return buttons;
+	}
+
 	/** Sync the active tool and standalone color swatch. */
 	refreshIndicator(): void {
 		const key = this.callbacks.getColor();
 		const enabled = this.callbacks.canPickColor();
 		this.colorButton.disabled = !enabled;
-		this.colorSwatch.style.backgroundColor = enabled ? this.getColors()[key] ?? key : "transparent";
+		// Keep showing the default color while disabled; CSS dims it.
+		this.colorSwatch.style.backgroundColor = this.getColors()[key] ?? key;
 		for (const [mode, button] of this.modeButtons) {
 			const active = !this.callbacks.isDrawing() && mode !== null && this.callbacks.getMode() === mode;
 			button.toggleClass("pr-tool-active", active);

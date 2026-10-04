@@ -272,13 +272,13 @@ function check(label, cond, detail = "") {
 		const rect = el => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, middle: (r.left + r.right) / 2 }; };
 		return { left: rect(v.headerEl.querySelector(".pr-header-start")), center: rect(v.headerEl.querySelector(".pr-header-center")), right: rect(v.headerEl.querySelector(".pr-header-end")), header: rect(v.headerEl), label: v.pageInputEl.value, count: v.pageTotalEl.textContent };
 	});
-	check("工具栏采用左导航、中间批注、右操作布局", toolbar.left.right < toolbar.center.left && toolbar.center.right < toolbar.right.left && Math.abs(toolbar.center.middle - toolbar.header.middle) < 2 && toolbar.label === "i" && toolbar.count === "1 / 30", JSON.stringify(toolbar));
+	check("工具栏采用左导航、中间批注、右操作布局", toolbar.left.right < toolbar.center.left && toolbar.center.right < toolbar.right.left && Math.abs(toolbar.center.middle - toolbar.header.middle) < 2 && toolbar.label === "i" && toolbar.count === "(1 / 30)", JSON.stringify(toolbar));
 	await page.getByRole("button", { name: "下一页", exact: true }).click();
 	await page.waitForFunction(() => window.__h.reader.currentPage === 2);
 	await page.getByRole("textbox", { name: "页码", exact: true }).fill("iii");
 	await page.getByRole("textbox", { name: "页码", exact: true }).press("Enter");
 	await page.waitForFunction(() => window.__h.reader.currentPage === 3);
-	check("页码框按 PDF 标签跳转并显示实际页数", await page.evaluate(() => window.__h.reader.pageInputEl.value === "iii" && window.__h.reader.pageTotalEl.textContent === "3 / 30"));
+	check("页码框按 PDF 标签跳转并显示实际页数", await page.evaluate(() => window.__h.reader.pageInputEl.value === "iii" && window.__h.reader.pageTotalEl.textContent === "(3 / 30)"));
 	await page.getByRole("textbox", { name: "页码", exact: true }).fill("1");
 	await page.getByRole("textbox", { name: "页码", exact: true }).press("Enter");
 	await page.waitForFunction(() => window.__h.reader.currentPage === 1);

@@ -146,6 +146,10 @@ export class PaperReaderView extends ItemView {
 	private searchDebounce: number | null = null;
 	private searchReturnFocus: HTMLElement | null = null;
 	private wheelZoomTimer: number | null = null;
+	private resizeObserver: ResizeObserver | null = null;
+	private resizeTimer: number | null = null;
+	private undoMenuBtn: HTMLButtonElement | null = null;
+	private redoMenuBtn: HTMLButtonElement | null = null;
 	private wheelZoomFactor = 1;
 	private wheelZoomPoint = { x: 0, y: 0 };
 	private wheelZoomRunning = false;
@@ -196,6 +200,8 @@ export class PaperReaderView extends ItemView {
 				onExportAll: () => void this.exportAllAnnotations(),
 			},
 			getColors: () => this.plugin.settings.highlightColors,
+			onModeChange: (mode) => this.setSidebarMode(mode),
+			hasOutline: () => !!this.outline?.length,
 		});
 		this.history = new AnnotationHistory(
 			(op, dir) => this.applyHistoryOp(op, dir),
@@ -252,6 +258,10 @@ export class PaperReaderView extends ItemView {
 		this.bodyEl.appendChild(this.panel.el);
 
 		this.scrollEl.tabIndex = -1;
+		// Refit "fit width/height" when the pane, sidebar or answer panel changes size.
+		this.resizeObserver = new ResizeObserver(() => this.onReaderResize());
+		this.resizeObserver.observe(this.contentEl);
+		this.resizeObserver.observe(this.scrollEl);
 		this.registerDomEvent(this.scrollEl, "wheel", (e: WheelEvent) => this.onZoomWheel(e), { passive: false });
 		this.registerDomEvent(this.scrollEl, "scroll", () => {
 			this.repositionPopup();
@@ -377,6 +387,9 @@ export class PaperReaderView extends ItemView {
 		this.closed = true;
 		if (this.wheelZoomTimer !== null) window.clearTimeout(this.wheelZoomTimer);
 		this.wheelZoomTimer = null; this.wheelZoomFactor = 1;
+		this.resizeObserver?.disconnect(); this.resizeObserver = null;
+		if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
+		this.resizeTimer = null;
 		this.passwordModal?.close();
 		this.cancelRangeEdit();
 		this.panel?.close();
@@ -527,8 +540,11 @@ export class PaperReaderView extends ItemView {
 	}
 
 
+	/** "/ total" beside the page box; the physical page is shown only when the PDF label differs. */
 	private pageCountLabel(): string {
-		return `${this.currentPage} / ${this.renderer.numPages}`;
+		const total = this.renderer.numPages;
+		const label = this.pageLabels?.[this.currentPage - 1];
+		return label && label !== String(this.currentPage) ? `(${this.currentPage} / ${total})` : `/ ${total}`;
 	}
 
 	private requestPdfPassword(update: (password: string) => void, reason: number): void {
@@ -822,15 +838,26 @@ export class PaperReaderView extends ItemView {
 		const start = this.headerEl.createDiv({ cls: "pr-header-start" });
 		const center = this.headerEl.createDiv({ cls: "pr-header-center" });
 		const end = this.headerEl.createDiv({ cls: "pr-header-end" });
-		let buttonParent = start;
+		// A main button and its dropdown read as one split control.
+		const group = (parent: HTMLElement, cls: string): HTMLElement => (buttonParent = parent.createDiv({ cls }));
+		const mkChevron = (tooltip: string, onClick: (e: MouseEvent) => void): HTMLButtonElement => {
+			const btn = mkBtn("chevron-down", tooltip, onClick);
+			btn.addClass("pr-header-chevron");
+			return btn;
+		};
+		let buttonParent: HTMLElement = start;
+		group(start, "pr-split");
 		mkBtn("panel-left", t("切换侧栏"), () => void this.toggleSidebar());
-		mkBtn("chevron-down", t("侧栏选项"), (e) => this.openSidebarMenu(e));
+		mkChevron(t("侧栏选项"), (e) => this.openSidebarMenu(e));
 		start.createDiv({ cls: "pr-divider" });
+		group(start, "pr-tool-group pr-hide-narrow");
 		mkBtn("zoom-out", t("缩小"), () => void this.zoomBy(1 / 1.2));
 		mkBtn("zoom-in", t("放大"), () => void this.zoomBy(1.2));
+		group(start, "pr-split");
 		mkBtn("move-horizontal", t("适应宽度"), () => void this.setZoomMode("fit-width"));
-		mkBtn("chevron-down", t("缩放与布局选项"), (e) => this.openZoomMenu(e));
-		start.createDiv({ cls: "pr-divider" });
+		mkChevron(t("缩放与布局选项"), (e) => this.openZoomMenu(e));
+		start.createDiv({ cls: "pr-divider pr-hide-compact" });
+		group(start, "pr-tool-group pr-hide-compact");
 		mkBtn("undo-2", t("返回上一阅读位置"), () => void this.goBack());
 		mkBtn("chevron-up", t("上一页"), () => void this.scrollToPage(this.currentPage - 1));
 		mkBtn("chevron-down", t("下一页"), () => void this.scrollToPage(this.currentPage + 1));
@@ -858,6 +885,19 @@ export class PaperReaderView extends ItemView {
 		this.selectionActions.setEnabled(!!this.currentPayload);
 		center.appendChild(this.selectionActions.el);
 		end.appendChild(this.selectionActions.secondaryEl);
+		// Controls hidden from a narrow header stay reachable from the overflow menu.
+		const overflow = this.selectionActions.addOverflowItems([
+			{ icon: "undo-2", label: t("返回上一阅读位置"), cls: "pr-only-compact", onClick: () => void this.goBack() },
+			{ icon: "chevron-up", label: t("上一页"), cls: "pr-only-compact", onClick: () => void this.scrollToPage(this.currentPage - 1) },
+			{ icon: "chevron-down", label: t("下一页"), cls: "pr-only-compact", onClick: () => void this.scrollToPage(this.currentPage + 1) },
+			{ icon: "zoom-out", label: t("缩小"), cls: "pr-only-narrow", onClick: () => void this.zoomBy(1 / 1.2) },
+			{ icon: "zoom-in", label: t("放大"), cls: "pr-only-narrow", onClick: () => void this.zoomBy(1.2) },
+			{ icon: "scan", label: t("矩形框"), cls: "pr-only-narrow", onClick: () => this.setDrawingTool(this.drawingTool === "rectangle" ? null : "rectangle") },
+			{ icon: "undo-2", label: t("撤销 (Cmd/Ctrl+Z)"), cls: "pr-only-narrow", onClick: () => void this.history.undo() },
+			{ icon: "redo-2", label: t("重做 (Cmd/Ctrl+Shift+Z)"), cls: "pr-only-narrow", onClick: () => void this.history.redo() },
+		]);
+		this.undoMenuBtn = overflow[6];
+		this.redoMenuBtn = overflow[7];
 
 		// PDF label followed by physical page / total, beside page navigation
 		const pageWrap = start.createDiv({ cls: "pr-page-wrap" });
@@ -887,16 +927,20 @@ export class PaperReaderView extends ItemView {
 		buttonParent = center;
 		this.rectangleBtn = mkBtn("scan", t("矩形框（再次点击或 Esc 退出）"), () =>
 			this.setDrawingTool(this.drawingTool === "rectangle" ? null : "rectangle"));
+		this.rectangleBtn.addClass("pr-hide-narrow");
+		group(center, "pr-split");
 		this.rectangleBtn.toggleClass("pr-pen-on", this.drawingTool === "rectangle");
 		this.rectangleBtn.setAttr("aria-pressed", String(this.drawingTool === "rectangle"));
 		this.penBtn = mkBtn("pencil", t("画笔（P 切换，Esc 退出）"), () =>
 			this.setDrawingTool(this.drawingTool === "pen" ? null : "pen"));
 		this.penBtn.toggleClass("pr-pen-on", this.drawingTool === "pen");
 		this.penBtn.setAttr("aria-pressed", String(this.drawingTool === "pen"));
-		mkBtn("chevron-down", t("画笔粗细"), e => this.openPenMenu(e));
+		mkChevron(t("画笔粗细"), e => this.openPenMenu(e));
+		buttonParent = center;
 		center.createDiv({ cls: "pr-divider" });
 		center.appendChild(this.selectionActions.colorButton);
-		center.createDiv({ cls: "pr-divider" });
+		center.createDiv({ cls: "pr-divider pr-hide-narrow" });
+		group(center, "pr-tool-group pr-hide-narrow");
 		this.undoBtn = mkBtn("undo-2", t("撤销 (Cmd/Ctrl+Z)"), () => void this.history.undo());
 		this.redoBtn = mkBtn("redo-2", t("重做 (Cmd/Ctrl+Shift+Z)"), () => void this.history.redo());
 		this.updateHistoryButtons();
@@ -1064,6 +1108,27 @@ export class PaperReaderView extends ItemView {
 	}
 
 	// ---- zoom / layout ----
+
+	private onReaderResize(): void {
+		if (this.closed) return;
+		const width = this.contentEl.clientWidth;
+		this.contentEl.toggleClass("pr-compact", width > 0 && width < 1000);
+		this.contentEl.toggleClass("pr-narrow", width > 0 && width < 720);
+		if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
+		this.resizeTimer = window.setTimeout(() => {
+			this.resizeTimer = null;
+			void this.refitAfterResize();
+		}, 120);
+	}
+
+	private async refitAfterResize(): Promise<void> {
+		if (this.closed || this.zoomMode === "manual" || this.pages.length === 0) return;
+		// Re-rendering mid-gesture would drop the stroke or range being dragged.
+		if (this.liveStroke || this.rangeDrag) { this.onReaderResize(); return; }
+		const next = this.computeScale();
+		if (Math.abs(next - this.scale) <= this.scale * 0.01) return;
+		await this.renderAll();
+	}
 
 	private computeScale(): number {
 		if (this.zoomMode === "manual" || !this.baseDims) return this.scale;
@@ -1558,6 +1623,8 @@ export class PaperReaderView extends ItemView {
 	private updateHistoryButtons(): void {
 		if (this.undoBtn) this.undoBtn.disabled = !this.history.canUndo;
 		if (this.redoBtn) this.redoBtn.disabled = !this.history.canRedo;
+		if (this.undoMenuBtn) this.undoMenuBtn.disabled = !this.history.canUndo;
+		if (this.redoMenuBtn) this.redoMenuBtn.disabled = !this.history.canRedo;
 	}
 
 	/** persist current annotations and refresh overlays + sidebar list */

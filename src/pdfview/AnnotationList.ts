@@ -2,12 +2,30 @@ import { t } from "../i18n";
 import { setIcon } from "obsidian";
 import type { Annotation } from "../storage/annotationStore";
 import { inkBoundingRect } from "./InkLayer";
+import { COLOR_KEYS } from "../settings";
+import { COLOR_LABELS } from "../toolbar/SelectionActions";
 
 export interface AnnotationListCallbacks {
 	onSelect: (ann: Annotation) => void;
 	onExport: (ann: Annotation) => void;
 	onExportAll: () => void;
 }
+
+export interface AnnotationFilter {
+	query: string;
+	/** empty = all colors */
+	colors: Set<string>;
+	/** empty = all types */
+	type: string;
+}
+
+const TYPE_LABELS: Record<string, string> = {
+	highlight: t("高亮"),
+	note: t("批注"),
+	translation: t("翻译"),
+	qa: t("AI 问答"),
+	ink: t("画笔"),
+};
 
 const TYPE_ICONS: Record<string, string> = {
 	highlight: "highlighter",
@@ -52,11 +70,71 @@ export function inkPreviewSvg(ann: Annotation, size = 48): SVGSVGElement | null 
 export class AnnotationList {
 	readonly el: HTMLElement;
 
+	private items: { el: HTMLElement; ann: Annotation }[] = [];
+	private countEl: HTMLElement | null = null;
+	private emptyEl: HTMLElement | null = null;
+
 	constructor(
 		private callbacks: AnnotationListCallbacks,
-		private getColors: () => Record<string, string>
+		private getColors: () => Record<string, string>,
+		private filter: AnnotationFilter = { query: "", colors: new Set(), type: "" }
 	) {
 		this.el = createDiv({ cls: "pr-ann-list" });
+	}
+
+	private matches(ann: Annotation): boolean {
+		const { query, colors, type } = this.filter;
+		if (colors.size && !colors.has(ann.color)) return false;
+		if (type && ann.type !== type) return false;
+		if (!query) return true;
+		const haystack = [ann.text, ann.note, ann.aiContent].filter(Boolean).join(" ").toLowerCase();
+		return haystack.includes(query.toLowerCase());
+	}
+
+	/** Show or hide rows in place so typing in the search box keeps focus. */
+	private applyFilter(): void {
+		let shown = 0;
+		for (const { el, ann } of this.items) {
+			const visible = this.matches(ann);
+			el.toggleClass("pr-hidden", !visible);
+			if (visible) shown++;
+		}
+		const filtered = shown !== this.items.length;
+		this.countEl?.setText(filtered ? `${shown} / ${this.items.length}` : String(this.items.length));
+		this.emptyEl?.toggleClass("pr-hidden", shown > 0 || this.items.length === 0);
+	}
+
+	private buildFilters(annotations: Annotation[]): void {
+		const bar = this.el.createDiv({ cls: "pr-ann-filters" });
+		const search = bar.createEl("input", { cls: "pr-ann-search", attr: { type: "search", placeholder: t("搜索标注…"), "aria-label": t("搜索标注") } });
+		search.value = this.filter.query;
+		search.addEventListener("input", () => { this.filter.query = search.value.trim(); this.applyFilter(); });
+		search.addEventListener("keydown", e => e.stopPropagation());
+
+		const row = bar.createDiv({ cls: "pr-ann-filter-row" });
+		const colors = this.getColors();
+		const usedColors = COLOR_KEYS.filter(key => annotations.some(a => a.color === key && a.type !== "ink"));
+		for (const key of usedColors) {
+			const chip = row.createEl("button", { cls: "pr-ann-color-chip", attr: { type: "button", "aria-label": t("只看{color}", { color: COLOR_LABELS[key] ?? key }) } });
+			chip.style.setProperty("--pr-chip-color", colors[key] ?? key);
+			const sync = () => { chip.toggleClass("is-active", this.filter.colors.has(key)); chip.setAttr("aria-pressed", String(this.filter.colors.has(key))); };
+			sync();
+			chip.addEventListener("click", () => {
+				if (this.filter.colors.has(key)) this.filter.colors.delete(key); else this.filter.colors.add(key);
+				sync(); this.applyFilter();
+			});
+		}
+		const types = Object.keys(TYPE_LABELS).filter(type => annotations.some(a => a.type === type));
+		if (types.length > 1) {
+			const select = row.createEl("select", { cls: "pr-ann-type dropdown", attr: { "aria-label": t("标注类型") } });
+			select.createEl("option", { text: t("全部类型"), attr: { value: "" } });
+			for (const type of types) select.createEl("option", { text: TYPE_LABELS[type], attr: { value: type } });
+			if (!types.includes(this.filter.type)) this.filter.type = "";
+			select.value = this.filter.type;
+			select.addEventListener("change", () => { this.filter.type = select.value; this.applyFilter(); });
+		} else {
+			this.filter.type = "";
+		}
 	}
 
 	build(annotations: Annotation[]): void {
@@ -69,21 +147,27 @@ export class AnnotationList {
 		});
 
 		const header = this.el.createDiv({ cls: "pr-ann-header" });
-		header.createSpan({ text: t("标注（{count}）", { count: sorted.length }) });
+		const title = header.createSpan({ cls: "pr-ann-title", text: t("标注") });
+		this.countEl = title.createSpan({ cls: "pr-ann-count", text: String(sorted.length) });
 		const exportAll = header.createEl("button", { cls: "clickable-icon" });
 		setIcon(exportAll, "file-output");
 		exportAll.setAttr("aria-label", t("全部导出到标注笔记"));
 		exportAll.addEventListener("click", () => this.callbacks.onExportAll());
 
+		this.items = [];
 		if (sorted.length === 0) {
 			this.el.createDiv({ cls: "pr-ann-empty", text: t("暂无标注") });
 			return;
 		}
+		this.buildFilters(sorted);
+		this.emptyEl = this.el.createDiv({ cls: "pr-ann-empty pr-hidden", text: t("没有匹配的标注") });
 
 		const colors = this.getColors();
 		for (const ann of sorted) {
 			const item = this.el.createDiv({ cls: "pr-ann-item" });
 			item.dataset.annotationId = ann.id;
+			this.items.push({ el: item, ann });
+			item.style.setProperty("--pr-ann-color", ann.type === "ink" ? "var(--text-faint)" : colors[ann.color] ?? "var(--text-faint)");
 			item.addEventListener("click", () => this.callbacks.onSelect(ann));
 
 			const iconEl = item.createSpan({ cls: "pr-ann-icon" });
@@ -123,5 +207,6 @@ export class AnnotationList {
 				this.callbacks.onExport(ann);
 			});
 		}
+		this.applyFilter();
 	}
 }
