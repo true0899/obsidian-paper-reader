@@ -2,6 +2,8 @@ globalThis.window = { setTimeout, clearTimeout } as unknown as Window & typeof g
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { runInNewContext } from "node:vm";
+import { execFileSync } from "node:child_process";
 import { App } from "obsidian";
 import { LlmClient, LlmError } from "../src/llm/client";
 import { desktopTransport, type ChatTransport } from "../src/llm/transport";
@@ -68,5 +70,30 @@ test("desktop transport streams a local endpoint and closes its socket on cancel
   const next = stream.next(); abort.abort();
   await assert.rejects(next, (e: LlmError) => e.code === "abort");
   await disconnected;
+ } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test("desktop bundle loads Node modules through Obsidian's CommonJS loader", async () => {
+ const built = execFileSync("node_modules/.bin/esbuild", ["src/llm/transport.ts",
+  "--bundle", "--format=iife", "--global-name=transportModule", "--platform=neutral", "--external:node:*", "--target=es2018"], { encoding: "utf8" });
+ const loaded: string[] = [];
+ const sandbox = { URL, Uint8Array, transportModule: undefined as unknown as { desktopTransport: ChatTransport },
+  require(id: string) { loaded.push(id); return require(id); } };
+ runInNewContext(built, sandbox, {
+  importModuleDynamically() { throw new Error("Chromium cannot load node: modules"); },
+ });
+ const server = createServer((_req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end('{"ok":true}'); });
+ await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+ try {
+  const address = server.address() as { port: number };
+  const response = await sandbox.transportModule.desktopTransport(`http://127.0.0.1:${address.port}/v1/chat/completions`, "{}", {}, new AbortController().signal);
+  let body = "";
+  for await (const chunk of response.body) body += new TextDecoder().decode(chunk);
+  assert.equal(response.status, 200);
+  assert.equal(body, '{"ok":true}');
+  assert.deepEqual(loaded, ["node:http", "node:zlib"]);
+  loaded.length = 0;
+  await assert.rejects(sandbox.transportModule.desktopTransport("https://127.0.0.1:1", "{}", {}, new AbortController().signal));
+  assert.deepEqual(loaded, ["node:https", "node:zlib"]);
  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
